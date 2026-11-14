@@ -1,0 +1,4 @@
+Build status: source package prepared; Windows binary not compiled in this environment.
+Reason: no Windows x64 MSVC/MinGW toolchain is installed in the build environment.
+The included GitHub Actions workflow compiles the DLL on windows-latest.
+This is a diagnostic DirectInput proxy only; no pedestrian/vehicle hooks are implemented yet.
