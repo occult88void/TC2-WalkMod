@@ -3,6 +3,8 @@
 #include <windows.h>
 #include <dinput.h>
 #include <tlhelp32.h>
+#include <bcrypt.h>
+#include <vector>
 #include <string>
 #include <cstdio>
 
@@ -42,6 +44,99 @@ const wchar_t* ProtectionName(DWORD p) noexcept {
     case PAGE_EXECUTE_WRITECOPY: return L"EXECUTE_WRITECOPY";
     default: return L"OTHER";
     }
+}
+
+
+std::wstring HexBytes(const BYTE* data, SIZE_T size) {
+    static const wchar_t* digits = L"0123456789ABCDEF";
+    std::wstring out;
+    out.reserve(size * 2);
+    for (SIZE_T i = 0; i < size; ++i) {
+        out.push_back(digits[data[i] >> 4]);
+        out.push_back(digits[data[i] & 0x0F]);
+    }
+    return out;
+}
+
+bool IsReadableProtection(DWORD protect) noexcept {
+    if (protect & (PAGE_GUARD | PAGE_NOACCESS)) return false;
+    switch (protect & 0xff) {
+    case PAGE_READONLY:
+    case PAGE_READWRITE:
+    case PAGE_WRITECOPY:
+    case PAGE_EXECUTE_READ:
+    case PAGE_EXECUTE_READWRITE:
+    case PAGE_EXECUTE_WRITECOPY:
+        return true;
+    default:
+        return false;
+    }
+}
+
+void LogExecutableSectionFingerprint(const wchar_t* name, const BYTE* address, SIZE_T size) noexcept {
+    wchar_t line[512]{};
+    if (!address || size == 0) return;
+
+    MEMORY_BASIC_INFORMATION firstMbi{};
+    if (!VirtualQuery(address, &firstMbi, sizeof(firstMbi)) || firstMbi.State != MEM_COMMIT ||
+        !IsReadableProtection(firstMbi.Protect)) {
+        swprintf_s(line, L"FINGERPRINT: %s skipped; first memory page is not readable/committed.", name);
+        WriteLog(line);
+        return;
+    }
+
+    BCRYPT_ALG_HANDLE algorithm = nullptr;
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    DWORD objectLength = 0, resultLength = 0;
+    std::vector<BYTE> hashObject;
+    BYTE digest[32]{};
+    NTSTATUS status = BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
+    if (status >= 0) status = BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH,
+        reinterpret_cast<PUCHAR>(&objectLength), sizeof(objectLength), &resultLength, 0);
+    if (status >= 0) {
+        hashObject.resize(objectLength);
+        status = BCryptCreateHash(algorithm, &hash, hashObject.data(), objectLength, nullptr, 0, 0);
+    }
+
+    bool complete = status >= 0;
+    SIZE_T offset = 0;
+    while (complete && offset < size) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        const BYTE* current = address + offset;
+        if (!VirtualQuery(current, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT || !IsReadableProtection(mbi.Protect)) {
+            complete = false;
+            break;
+        }
+        const BYTE* regionEnd = static_cast<const BYTE*>(mbi.BaseAddress) + mbi.RegionSize;
+        if (regionEnd <= current) { complete = false; break; }
+        SIZE_T available = static_cast<SIZE_T>(regionEnd - current);
+        SIZE_T remaining = size - offset;
+        SIZE_T regionBytes = (available < remaining) ? available : remaining;
+        SIZE_T consumed = 0;
+        while (consumed < regionBytes) {
+            const ULONG chunk = static_cast<ULONG>((regionBytes - consumed) > (1024 * 1024) ? (1024 * 1024) : (regionBytes - consumed));
+            status = BCryptHashData(hash, const_cast<PUCHAR>(current + consumed), chunk, 0);
+            if (status < 0) { complete = false; break; }
+            consumed += chunk;
+        }
+        offset += regionBytes;
+    }
+
+    if (complete) status = BCryptFinishHash(hash, digest, sizeof(digest), 0);
+    if (hash) BCryptDestroyHash(hash);
+    if (algorithm) BCryptCloseAlgorithmProvider(algorithm, 0);
+
+    if (complete && status >= 0) {
+        const SIZE_T sampleSize = size < 32 ? size : 32;
+        const std::wstring digestHex = HexBytes(digest, sizeof(digest));
+        const std::wstring sampleHex = HexBytes(address, sampleSize);
+        swprintf_s(line, L"FINGERPRINT: %s size=0x%llX sha256=%s first_bytes=%s",
+            name, static_cast<unsigned long long>(size), digestHex.c_str(), sampleHex.c_str());
+    } else {
+        swprintf_s(line, L"FINGERPRINT: %s incomplete; readable committed bytes=%llu of %llu; NTSTATUS=0x%08lX",
+            name, static_cast<unsigned long long>(offset), static_cast<unsigned long long>(size), static_cast<unsigned long>(status));
+    }
+    WriteLog(line);
 }
 
 void LogModuleList() noexcept {
@@ -91,11 +186,14 @@ void LogGameSections() noexcept {
             static_cast<unsigned long>(sec[i].Characteristics), protection,
             queried ? static_cast<unsigned long>(mbi.State) : 0ul);
         WriteLog(line);
+        if (sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) {
+            LogExecutableSectionFingerprint(nameW, address, static_cast<SIZE_T>(sec[i].Misc.VirtualSize));
+        }
     }
 }
 
 BOOL CALLBACK InitializeProxy(PINIT_ONCE, PVOID, PVOID*) noexcept {
-    WriteLog(L"=== TC2 Walkmod diagnostic bootstrap 03 ===");
+    WriteLog(L"=== TC2 Walkmod diagnostic bootstrap 04 ===");
     wchar_t path[MAX_PATH]{};
     const DWORD pathLen = GetModuleFileNameW(nullptr, path, MAX_PATH);
     if (pathLen && pathLen < MAX_PATH) { wchar_t line[MAX_PATH + 64]{}; swprintf_s(line, L"Game executable: %s", path); WriteLog(line); }
