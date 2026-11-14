@@ -11,7 +11,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Get source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Configure x64 build
         run: cmake -S . -B build -A x64
@@ -20,7 +20,7 @@ jobs:
         run: cmake --build build --config Release
 
       - name: Upload DLL and symbols
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: TC2-Walkmod-bootstrap-x64
           path: |
