@@ -398,6 +398,90 @@ void ScanExecutableSectionsForHashes() {
     Log(L"=== HASH SCAN END ===");
 }
 
+
+void DumpSpawnHashCodeWindow() {
+    constexpr DWORD targetRva = 0x044E8A08u;
+    constexpr DWORD windowBefore = 0x40u;
+    constexpr SIZE_T windowSize = 0x100u;
+
+    HMODULE image = GetModuleHandleW(nullptr);
+    if (!image || targetRva < windowBefore) {
+        Log(L"CODE_WINDOW_ERROR: invalid image or target RVA");
+        return;
+    }
+
+    const BYTE* base = reinterpret_cast<const BYTE*>(image);
+    const auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+        Log(L"CODE_WINDOW_ERROR: invalid DOS signature");
+        return;
+    }
+    const auto nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE ||
+        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
+        targetRva >= nt->OptionalHeader.SizeOfImage) {
+        Log(L"CODE_WINDOW_ERROR: invalid PE header or target outside image");
+        return;
+    }
+
+    const DWORD startRva = targetRva - windowBefore;
+    const DWORD endRva = startRva + static_cast<DWORD>(windowSize);
+    bool insideExecutableSection = false;
+    const IMAGE_SECTION_HEADER* section = IMAGE_FIRST_SECTION(nt);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
+        const DWORD sectionStart = section->VirtualAddress;
+        const DWORD sectionSize = section->Misc.VirtualSize;
+        const DWORD sectionEnd = sectionStart + sectionSize;
+        if ((section->Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0 &&
+            startRva >= sectionStart && endRva <= sectionEnd) {
+            insideExecutableSection = true;
+            break;
+        }
+    }
+    if (!insideExecutableSection) {
+        Log(L"CODE_WINDOW_ERROR: requested range is not fully inside an executable PE section");
+        return;
+    }
+
+    const BYTE* source = base + startRva;
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(source, &mbi, sizeof(mbi)) != sizeof(mbi) ||
+        mbi.State != MEM_COMMIT || !IsReadableProtection(mbi.Protect)) {
+        Log(L"CODE_WINDOW_ERROR: memory range is not committed/readable");
+        return;
+    }
+
+    std::vector<BYTE> bytes(windowSize);
+    SIZE_T bytesRead = 0;
+    if (!ReadProcessMemory(GetCurrentProcess(), source, bytes.data(), windowSize, &bytesRead) ||
+        bytesRead != windowSize) {
+        Log(L"CODE_WINDOW_ERROR: ReadProcessMemory requested=0x%llX received=0x%llX error=%lu",
+            static_cast<unsigned long long>(windowSize),
+            static_cast<unsigned long long>(bytesRead), GetLastError());
+        return;
+    }
+
+    Log(L"=== CODE WINDOW BEGIN (read-only) ===");
+    Log(L"CODE_WINDOW_TARGET: hash=CMissionAtomSpawn hash_rva=0x%08X start_rva=0x%08X size=0x%llX",
+        targetRva, startRva, static_cast<unsigned long long>(windowSize));
+
+    for (SIZE_T offset = 0; offset < bytes.size(); offset += 16) {
+        char hex[16 * 3 + 1]{};
+        SIZE_T cursor = 0;
+        const SIZE_T count = (bytes.size() - offset < 16) ? bytes.size() - offset : 16;
+        for (SIZE_T i = 0; i < count; ++i) {
+            const int written = sprintf_s(hex + cursor, sizeof(hex) - cursor,
+                "%02X%s", static_cast<unsigned>(bytes[offset + i]),
+                (i + 1 < count) ? " " : "");
+            if (written <= 0) break;
+            cursor += static_cast<SIZE_T>(written);
+        }
+        Log(L"CODE_BYTES: rva=0x%08X bytes=%S",
+            startRva + static_cast<DWORD>(offset), hex);
+    }
+    Log(L"=== CODE WINDOW END ===");
+}
+
 void LogImageInfo() {
     HMODULE image = GetModuleHandleW(nullptr);
     if (!image) {
@@ -471,6 +555,7 @@ DWORD WINAPI DiagnosticWorker(LPVOID) {
     Log(L"HASHSCAN: waiting 25 seconds for game initialization before scanning executable sections");
     Sleep(25000);
     ScanExecutableSectionsForHashes();
+    DumpSpawnHashCodeWindow();
     return 0;
 }
 
