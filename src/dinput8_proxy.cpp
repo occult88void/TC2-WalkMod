@@ -463,7 +463,7 @@ void LogModules() {
 DWORD WINAPI DiagnosticWorker(LPVOID) {
     wchar_t exePath[MAX_PATH]{};
     GetModuleFileNameW(nullptr, exePath, MAX_PATH);
-    Log(L"=== TC2 Walkmod diagnostic bootstrap 05 (runtime hash probe) ===");
+    Log(L"=== TC2 Walkmod diagnostic bootstrap 06 (runtime hash probe) ===");
     Log(L"Game executable: %s", exePath);
     LogImageInfo();
     LogModules();
