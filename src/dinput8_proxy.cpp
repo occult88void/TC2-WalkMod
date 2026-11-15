@@ -120,15 +120,6 @@ void LogFingerprint(const char* sectionName, const BYTE* address, SIZE_T size) {
     std::vector<BYTE> buffer(chunkSize);
 
     while (offset < size) {
-        if (GetTickCount64() >= scanDeadline) {
-            Log(L"HASHSCAN_TIMEOUT: section=%S offset=0x%llX/%0llX read=0x%llX skipped=0x%llX",
-                sectionName, static_cast<unsigned long long>(offset),
-                static_cast<unsigned long long>(size),
-                static_cast<unsigned long long>(totalRead),
-                static_cast<unsigned long long>(totalSkipped));
-            break;
-        }
-
         MEMORY_BASIC_INFORMATION mbi{};
         const BYTE* current = address + offset;
         if (VirtualQuery(current, &mbi, sizeof(mbi)) != sizeof(mbi) ||
@@ -223,6 +214,15 @@ void ScanExecutableSectionForHashes(const char* sectionName, const BYTE* address
         static_cast<unsigned long long>(chunkSize));
 
     while (offset < size) {
+        if (GetTickCount64() >= scanDeadline) {
+            Log(L"HASHSCAN_TIMEOUT: section=%S offset=0x%llX/%0llX read=0x%llX skipped=0x%llX",
+                sectionName, static_cast<unsigned long long>(offset),
+                static_cast<unsigned long long>(size),
+                static_cast<unsigned long long>(totalRead),
+                static_cast<unsigned long long>(totalSkipped));
+            break;
+        }
+
         MEMORY_BASIC_INFORMATION mbi{};
         const BYTE* current = address + offset;
         if (VirtualQuery(current, &mbi, sizeof(mbi)) != sizeof(mbi)) {
