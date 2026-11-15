@@ -196,7 +196,7 @@ constexpr HashProbeTarget kHashProbeTargets[] = {
     { "CMissionAtomDisablePedestrian", 0x80E55B58u },
 };
 
-void ScanExecutableSectionForHashes(const char* sectionName, const BYTE* address,
+void ScanReadableSectionForHashes(const char* sectionName, const BYTE* address,
                                     SIZE_T size, const BYTE* imageBase,
                                     ULONGLONG scanDeadline) {
     std::uint64_t counts[_countof(kHashProbeTargets)]{};
@@ -205,6 +205,7 @@ void ScanExecutableSectionForHashes(const char* sectionName, const BYTE* address
     SIZE_T lastProgress = 0;
     std::uint64_t totalRead = 0;
     std::uint64_t totalSkipped = 0;
+    bool timedOut = false;
     constexpr SIZE_T chunkSize = 64 * 1024;
     std::vector<BYTE> carry;
     carry.reserve(sizeof(std::uint32_t) - 1);
@@ -215,6 +216,7 @@ void ScanExecutableSectionForHashes(const char* sectionName, const BYTE* address
 
     while (offset < size) {
         if (GetTickCount64() >= scanDeadline) {
+            timedOut = true;
             Log(L"HASHSCAN_TIMEOUT: section=%S offset=0x%llX/%0llX read=0x%llX skipped=0x%llX",
                 sectionName, static_cast<unsigned long long>(offset),
                 static_cast<unsigned long long>(size),
@@ -298,9 +300,9 @@ void ScanExecutableSectionForHashes(const char* sectionName, const BYTE* address
 
             ++counts[t];
             if (printed[t] < 8) {
-                char context[24 * 3 + 1]{};
-                const SIZE_T contextStart = (i > 8) ? (i - 8) : 0;
-                const SIZE_T contextEnd = ((i + 8 + 4) < scanData.size()) ? (i + 8 + 4) : scanData.size();
+                char context[36 * 3 + 1]{};
+                const SIZE_T contextStart = (i > 16) ? (i - 16) : 0;
+                const SIZE_T contextEnd = ((i + 16 + 4 + 16) < scanData.size()) ? (i + 16 + 4 + 16) : scanData.size();
                 SIZE_T cursor = 0;
                 for (SIZE_T j = contextStart; j < contextEnd; ++j) {
                     const int written = sprintf_s(context + cursor, sizeof(context) - cursor,
@@ -357,12 +359,13 @@ void ScanExecutableSectionForHashes(const char* sectionName, const BYTE* address
         }
     }
 
-    Log(L"HASHSCAN_SECTION_END: %S read=0x%llX skipped=0x%llX",
+    const wchar_t* sectionStatus = timedOut ? L"TIMEOUT" : (totalSkipped ? L"PARTIAL" : L"COMPLETE");
+    Log(L"HASHSCAN_SECTION_END: %S read=0x%llX skipped=0x%llX status=%s",
         sectionName, static_cast<unsigned long long>(totalRead),
-        static_cast<unsigned long long>(totalSkipped));
+        static_cast<unsigned long long>(totalSkipped), sectionStatus);
 }
 
-void ScanExecutableSectionsForHashes() {
+void ScanReadableSectionsForHashes() {
     HMODULE image = GetModuleHandleW(nullptr);
     if (!image) return;
     const BYTE* base = reinterpret_cast<const BYTE*>(image);
@@ -371,28 +374,33 @@ void ScanExecutableSectionsForHashes() {
     const auto nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
     if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return;
 
-    Log(L"=== HASH SCAN BEGIN (read-only executable memory scan, 30s limit) ===");
+    Log(L"=== HASH SCAN BEGIN (read-only executable + .rdata/.data scan, 30s limit) ===");
     const ULONGLONG scanDeadline = GetTickCount64() + 30000;
     const IMAGE_SECTION_HEADER* section = IMAGE_FIRST_SECTION(nt);
     for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
-        if ((section->Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0 || section->Misc.VirtualSize == 0) continue;
+        if (section->Misc.VirtualSize == 0) continue;
         char name[9]{};
         memcpy(name, section->Name, 8);
+        const bool executable = (section->Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0;
+        const bool namedData = (strcmp(name, ".rdata") == 0 || strcmp(name, ".data") == 0);
+        if (!executable && !namedData) continue;
+
         const BYTE* address = base + section->VirtualAddress;
         if (GetTickCount64() >= scanDeadline) {
             Log(L"HASHSCAN_SECTION_NOT_STARTED: %S reason=global_time_budget_exhausted", name);
             break;
         }
-        Log(L"HASHSCAN_SECTION: %S rva=0x%08X size=0x%08X", name,
+        Log(L"HASHSCAN_SECTION: %S kind=%s rva=0x%08X size=0x%08X", name,
+            executable ? L"EXECUTABLE" : L"DATA",
             section->VirtualAddress, static_cast<DWORD>(section->Misc.VirtualSize));
         try {
-            ScanExecutableSectionForHashes(name, address, section->Misc.VirtualSize, base, scanDeadline);
+            ScanReadableSectionForHashes(name, address, section->Misc.VirtualSize, base, scanDeadline);
         } catch (...) {
             Log(L"HASHSCAN_SECTION_EXCEPTION: %S", name);
         }
     }
     if (GetTickCount64() >= scanDeadline) {
-        Log(L"HASHSCAN: global time budget exhausted; remaining executable sections were not scanned");
+        Log(L"HASHSCAN: global time budget exhausted; remaining selected sections were not scanned");
     }
     Log(L"=== HASH SCAN END ===");
 }
@@ -463,13 +471,13 @@ void LogModules() {
 DWORD WINAPI DiagnosticWorker(LPVOID) {
     wchar_t exePath[MAX_PATH]{};
     GetModuleFileNameW(nullptr, exePath, MAX_PATH);
-    Log(L"=== TC2 Walkmod diagnostic bootstrap 06 (runtime hash probe) ===");
+    Log(L"=== TC2 Walkmod diagnostic bootstrap 07 (readable section hash probe) ===");
     Log(L"Game executable: %s", exePath);
     LogImageInfo();
     LogModules();
-    Log(L"HASHSCAN: waiting 25 seconds for game initialization before scanning executable sections");
+    Log(L"HASHSCAN: waiting 25 seconds for game initialization before scanning selected readable sections");
     Sleep(25000);
-    ScanExecutableSectionsForHashes();
+    ScanReadableSectionsForHashes();
     return 0;
 }
 
