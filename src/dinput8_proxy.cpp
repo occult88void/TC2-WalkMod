@@ -56,10 +56,23 @@ void Log(const wchar_t* format, ...) {
     _vsnwprintf_s(message, _countof(message), _TRUNCATE, format, args);
     va_end(args);
 
+    // Write explicit UTF-8 bytes instead of relying on the CRT's wide-file
+    // encoding mode. This prevents the log from appearing as CJK/mojibake
+    // when copied between Windows tools.
+    const int required = WideCharToMultiByte(CP_UTF8, 0, message, -1, nullptr, 0, nullptr, nullptr);
+    if (required <= 1) return;
+    std::vector<char> utf8(static_cast<size_t>(required));
+    if (WideCharToMultiByte(CP_UTF8, 0, message, -1, utf8.data(), required, nullptr, nullptr) <= 0) return;
+
     const std::wstring path = GetLogPath();
     FILE* file = nullptr;
-    if (_wfopen_s(&file, path.c_str(), L"a+, ccs=UTF-8") == 0 && file) {
-        fwprintf(file, L"%s\n", message);
+    if (_wfopen_s(&file, path.c_str(), L"ab") == 0 && file) {
+        if (_fseeki64(file, 0, SEEK_END) == 0 && _ftelli64(file) == 0) {
+            static const unsigned char bom[] = { 0xEF, 0xBB, 0xBF };
+            fwrite(bom, 1, sizeof(bom), file);
+        }
+        fwrite(utf8.data(), 1, static_cast<size_t>(required - 1), file);
+        fwrite("\r\n", 1, 2, file);
         fclose(file);
     }
 }
