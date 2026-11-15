@@ -170,6 +170,116 @@ void LogFingerprint(const char* sectionName, const BYTE* address, SIZE_T size) {
     BCryptCloseAlgorithmProvider(algorithm, 0);
 }
 
+
+struct HashProbeTarget {
+    const char* name;
+    std::uint32_t value;
+};
+
+constexpr HashProbeTarget kHashProbeTargets[] = {
+    { "CITEntityAvatarTC2", 0x2155AD67u },
+    { "CITEntityAvatarSettings", 0x20F54DA4u },
+    { "PlayerCharacterSetting", 0x31D9280Du },
+    { "CITEntityHeadQuarterCharacterSpawnPoint", 0xAE884E8Fu },
+    { "CITEntityHeadQuarterExitPoint", 0x5AA79419u },
+    { "CMissionAtomSpawn", 0x430810CAu },
+    { "CMissionAtomGetLocalPlayer", 0xB0B2E4E7u },
+    { "CMissionAtomTeleportEntity", 0x5D01241Du },
+    { "CMissionAtomDisablePedestrian", 0x80E55B58u },
+};
+
+void ScanExecutableSectionForHashes(const char* sectionName, const BYTE* address,
+                                    SIZE_T size, const BYTE* imageBase) {
+    std::uint64_t counts[_countof(kHashProbeTargets)]{};
+    unsigned printed[_countof(kHashProbeTargets)]{};
+    SIZE_T offset = 0;
+
+    while (offset < size) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        const BYTE* current = address + offset;
+        if (VirtualQuery(current, &mbi, sizeof(mbi)) != sizeof(mbi)) {
+            break;
+        }
+
+        const BYTE* regionEnd = static_cast<const BYTE*>(mbi.BaseAddress) + mbi.RegionSize;
+        if (regionEnd <= current) {
+            break;
+        }
+        const SIZE_T available = static_cast<SIZE_T>(regionEnd - current);
+        const SIZE_T regionBytes = (size - offset < available) ? (size - offset) : available;
+
+        if (mbi.State == MEM_COMMIT && IsReadableProtection(mbi.Protect) && regionBytes >= sizeof(std::uint32_t)) {
+            for (SIZE_T i = 0; i + sizeof(std::uint32_t) <= regionBytes; ++i) {
+                std::uint32_t value = 0;
+                std::memcpy(&value, current + i, sizeof(value));
+                size_t t = _countof(kHashProbeTargets);
+                switch (value) {
+                    case 0x2155AD67u: t = 0; break;
+                    case 0x20F54DA4u: t = 1; break;
+                    case 0x31D9280Du: t = 2; break;
+                    case 0xAE884E8Fu: t = 3; break;
+                    case 0x5AA79419u: t = 4; break;
+                    case 0x430810CAu: t = 5; break;
+                    case 0xB0B2E4E7u: t = 6; break;
+                    case 0x5D01241Du: t = 7; break;
+                    case 0x80E55B58u: t = 8; break;
+                    default: break;
+                }
+                if (t == _countof(kHashProbeTargets)) continue;
+                ++counts[t];
+                if (printed[t] < 8) {
+                    char context[16 * 3 + 1]{};
+                    const SIZE_T contextStart = (i > 8) ? (i - 8) : 0;
+                    const SIZE_T contextEnd = ((i + 8 + 4) < regionBytes) ? (i + 8 + 4) : regionBytes;
+                    SIZE_T cursor = 0;
+                    for (SIZE_T j = contextStart; j < contextEnd; ++j) {
+                        const int written = sprintf_s(context + cursor, sizeof(context) - cursor,
+                            "%02X%s", static_cast<unsigned>(current[j]), (j + 1 < contextEnd) ? " " : "");
+                        if (written <= 0) break;
+                        cursor += static_cast<SIZE_T>(written);
+                    }
+                    const DWORD rva = static_cast<DWORD>((current + i) - imageBase);
+                    Log(L"HASHREF: section=%S name=%S hash=0x%08X rva=0x%08X address=%p bytes=%S",
+                        sectionName, kHashProbeTargets[t].name, value, rva, current + i, context);
+                    ++printed[t];
+                }
+            }
+        }
+        offset += regionBytes;
+    }
+
+    for (size_t t = 0; t < _countof(kHashProbeTargets); ++t) {
+        if (counts[t] != 0) {
+            Log(L"HASHSCAN: section=%S name=%S total=%llu logged=%u",
+                sectionName, kHashProbeTargets[t].name,
+                static_cast<unsigned long long>(counts[t]), printed[t]);
+        }
+    }
+}
+
+void ScanExecutableSectionsForHashes() {
+    HMODULE image = GetModuleHandleW(nullptr);
+    if (!image) return;
+    const BYTE* base = reinterpret_cast<const BYTE*>(image);
+    const auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
+    const auto nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return;
+
+    Log(L"=== HASH SCAN BEGIN (read-only executable memory scan) ===");
+    const IMAGE_SECTION_HEADER* section = IMAGE_FIRST_SECTION(nt);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
+        if ((section->Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0 || section->Misc.VirtualSize == 0) continue;
+        char name[9]{};
+        memcpy(name, section->Name, 8);
+        const BYTE* address = base + section->VirtualAddress;
+        Log(L"HASHSCAN_SECTION: %S rva=0x%08X size=0x%08X", name,
+            section->VirtualAddress, static_cast<DWORD>(section->Misc.VirtualSize));
+        ScanExecutableSectionForHashes(name, address, section->Misc.VirtualSize, base);
+    }
+    Log(L"=== HASH SCAN END ===");
+}
+
 void LogImageInfo() {
     HMODULE image = GetModuleHandleW(nullptr);
     if (!image) {
@@ -236,10 +346,13 @@ void LogModules() {
 DWORD WINAPI DiagnosticWorker(LPVOID) {
     wchar_t exePath[MAX_PATH]{};
     GetModuleFileNameW(nullptr, exePath, MAX_PATH);
-    Log(L"=== TC2 Walkmod diagnostic bootstrap 04 (bcrypt fix) ===");
+    Log(L"=== TC2 Walkmod diagnostic bootstrap 05 (runtime hash probe) ===");
     Log(L"Game executable: %s", exePath);
     LogImageInfo();
     LogModules();
+    Log(L"HASHSCAN: waiting 25 seconds for game initialization before scanning executable sections");
+    Sleep(25000);
+    ScanExecutableSectionsForHashes();
     return 0;
 }
 
