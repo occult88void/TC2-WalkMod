@@ -116,7 +116,9 @@ void LogFingerprint(const char* sectionName, const BYTE* address, SIZE_T size) {
 
     bool complete = true;
     SIZE_T offset = 0;
-    constexpr SIZE_T chunkSize = 1024 * 1024;
+    constexpr SIZE_T chunkSize = 64 * 1024;
+    std::vector<BYTE> buffer(chunkSize);
+
     while (offset < size) {
         MEMORY_BASIC_INFORMATION mbi{};
         const BYTE* current = address + offset;
@@ -131,21 +133,27 @@ void LogFingerprint(const char* sectionName, const BYTE* address, SIZE_T size) {
             complete = false;
             break;
         }
-        SIZE_T available = static_cast<SIZE_T>(regionEnd - current);
-        SIZE_T regionBytes = (size - offset < available) ? (size - offset) : available;
-        SIZE_T hashedInRegion = 0;
-        while (hashedInRegion < regionBytes) {
-            const SIZE_T remaining = regionBytes - hashedInRegion;
-            const ULONG part = static_cast<ULONG>((remaining > chunkSize) ? chunkSize : remaining);
-            status = BCryptHashData(hash, const_cast<PUCHAR>(current + hashedInRegion), part, 0);
-            if (status < 0) {
-                complete = false;
-                break;
-            }
-            hashedInRegion += part;
+        const SIZE_T available = static_cast<SIZE_T>(regionEnd - current);
+        const SIZE_T regionBytes = (size - offset < available) ? (size - offset) : available;
+        const SIZE_T part = (regionBytes > chunkSize) ? chunkSize : regionBytes;
+
+        SIZE_T bytesRead = 0;
+        if (!ReadProcessMemory(GetCurrentProcess(), current, buffer.data(), part, &bytesRead) ||
+            bytesRead != part) {
+            Log(L"FINGERPRINT: %S read failed offset=0x%llX requested=0x%llX received=0x%llX error=%lu",
+                sectionName, static_cast<unsigned long long>(offset),
+                static_cast<unsigned long long>(part),
+                static_cast<unsigned long long>(bytesRead), GetLastError());
+            complete = false;
+            break;
         }
-        if (!complete) break;
-        offset += regionBytes;
+
+        status = BCryptHashData(hash, buffer.data(), static_cast<ULONG>(bytesRead), 0);
+        if (status < 0) {
+            complete = false;
+            break;
+        }
+        offset += bytesRead;
     }
 
     BYTE digest[32]{};
@@ -193,59 +201,142 @@ void ScanExecutableSectionForHashes(const char* sectionName, const BYTE* address
     std::uint64_t counts[_countof(kHashProbeTargets)]{};
     unsigned printed[_countof(kHashProbeTargets)]{};
     SIZE_T offset = 0;
+    SIZE_T lastProgress = 0;
+    std::uint64_t totalRead = 0;
+    std::uint64_t totalSkipped = 0;
+    constexpr SIZE_T chunkSize = 64 * 1024;
+    std::vector<BYTE> carry;
+    carry.reserve(sizeof(std::uint32_t) - 1);
+
+    Log(L"HASHSCAN_SECTION_BEGIN: %S size=0x%llX chunk=0x%llX",
+        sectionName, static_cast<unsigned long long>(size),
+        static_cast<unsigned long long>(chunkSize));
 
     while (offset < size) {
         MEMORY_BASIC_INFORMATION mbi{};
         const BYTE* current = address + offset;
         if (VirtualQuery(current, &mbi, sizeof(mbi)) != sizeof(mbi)) {
-            break;
+            const SIZE_T step = (size - offset > 0x1000) ? 0x1000 : (size - offset);
+            Log(L"HASHSCAN_SKIP: section=%S offset=0x%llX reason=VirtualQuery_failed error=%lu",
+                sectionName, static_cast<unsigned long long>(offset), GetLastError());
+            offset += step;
+            totalSkipped += step;
+            carry.clear();
+            continue;
         }
 
         const BYTE* regionEnd = static_cast<const BYTE*>(mbi.BaseAddress) + mbi.RegionSize;
         if (regionEnd <= current) {
-            break;
+            const SIZE_T step = (size - offset > 0x1000) ? 0x1000 : (size - offset);
+            Log(L"HASHSCAN_SKIP: section=%S offset=0x%llX reason=invalid_region",
+                sectionName, static_cast<unsigned long long>(offset));
+            offset += step;
+            totalSkipped += step;
+            carry.clear();
+            continue;
         }
+
         const SIZE_T available = static_cast<SIZE_T>(regionEnd - current);
         const SIZE_T regionBytes = (size - offset < available) ? (size - offset) : available;
+        if (mbi.State != MEM_COMMIT || !IsReadableProtection(mbi.Protect)) {
+            Log(L"HASHSCAN_SKIP: section=%S offset=0x%llX bytes=0x%llX state=0x%lX protect=0x%08X",
+                sectionName, static_cast<unsigned long long>(offset),
+                static_cast<unsigned long long>(regionBytes), mbi.State, mbi.Protect);
+            offset += regionBytes;
+            totalSkipped += regionBytes;
+            carry.clear();
+            continue;
+        }
 
-        if (mbi.State == MEM_COMMIT && IsReadableProtection(mbi.Protect) && regionBytes >= sizeof(std::uint32_t)) {
-            for (SIZE_T i = 0; i + sizeof(std::uint32_t) <= regionBytes; ++i) {
-                std::uint32_t value = 0;
-                std::memcpy(&value, current + i, sizeof(value));
-                size_t t = _countof(kHashProbeTargets);
-                switch (value) {
-                    case 0x2155AD67u: t = 0; break;
-                    case 0x20F54DA4u: t = 1; break;
-                    case 0x31D9280Du: t = 2; break;
-                    case 0xAE884E8Fu: t = 3; break;
-                    case 0x5AA79419u: t = 4; break;
-                    case 0x430810CAu: t = 5; break;
-                    case 0xB0B2E4E7u: t = 6; break;
-                    case 0x5D01241Du: t = 7; break;
-                    case 0x80E55B58u: t = 8; break;
-                    default: break;
+        const SIZE_T requested = (regionBytes > chunkSize) ? chunkSize : regionBytes;
+        std::vector<BYTE> block(requested);
+        SIZE_T bytesRead = 0;
+        const BOOL readOk = ReadProcessMemory(GetCurrentProcess(), current,
+            block.data(), requested, &bytesRead);
+        if (bytesRead == 0) {
+            Log(L"HASHSCAN_READ_ERROR: section=%S offset=0x%llX requested=0x%llX error=%lu",
+                sectionName, static_cast<unsigned long long>(offset),
+                static_cast<unsigned long long>(requested), GetLastError());
+            offset += requested;
+            totalSkipped += requested;
+            carry.clear();
+            continue;
+        }
+
+        std::vector<BYTE> scanData;
+        scanData.reserve(carry.size() + bytesRead);
+        scanData.insert(scanData.end(), carry.begin(), carry.end());
+        scanData.insert(scanData.end(), block.begin(), block.begin() + bytesRead);
+
+        for (SIZE_T i = 0; i + sizeof(std::uint32_t) <= scanData.size(); ++i) {
+            std::uint32_t value = 0;
+            std::memcpy(&value, scanData.data() + i, sizeof(value));
+            size_t t = _countof(kHashProbeTargets);
+            switch (value) {
+                case 0x2155AD67u: t = 0; break;
+                case 0x20F54DA4u: t = 1; break;
+                case 0x31D9280Du: t = 2; break;
+                case 0xAE884E8Fu: t = 3; break;
+                case 0x5AA79419u: t = 4; break;
+                case 0x430810CAu: t = 5; break;
+                case 0xB0B2E4E7u: t = 6; break;
+                case 0x5D01241Du: t = 7; break;
+                case 0x80E55B58u: t = 8; break;
+                default: break;
+            }
+            if (t == _countof(kHashProbeTargets)) continue;
+
+            ++counts[t];
+            if (printed[t] < 8) {
+                char context[24 * 3 + 1]{};
+                const SIZE_T contextStart = (i > 8) ? (i - 8) : 0;
+                const SIZE_T contextEnd = ((i + 8 + 4) < scanData.size()) ? (i + 8 + 4) : scanData.size();
+                SIZE_T cursor = 0;
+                for (SIZE_T j = contextStart; j < contextEnd; ++j) {
+                    const int written = sprintf_s(context + cursor, sizeof(context) - cursor,
+                        "%02X%s", static_cast<unsigned>(scanData[j]),
+                        (j + 1 < contextEnd) ? " " : "");
+                    if (written <= 0) break;
+                    cursor += static_cast<SIZE_T>(written);
                 }
-                if (t == _countof(kHashProbeTargets)) continue;
-                ++counts[t];
-                if (printed[t] < 8) {
-                    char context[16 * 3 + 1]{};
-                    const SIZE_T contextStart = (i > 8) ? (i - 8) : 0;
-                    const SIZE_T contextEnd = ((i + 8 + 4) < regionBytes) ? (i + 8 + 4) : regionBytes;
-                    SIZE_T cursor = 0;
-                    for (SIZE_T j = contextStart; j < contextEnd; ++j) {
-                        const int written = sprintf_s(context + cursor, sizeof(context) - cursor,
-                            "%02X%s", static_cast<unsigned>(current[j]), (j + 1 < contextEnd) ? " " : "");
-                        if (written <= 0) break;
-                        cursor += static_cast<SIZE_T>(written);
-                    }
-                    const DWORD rva = static_cast<DWORD>((current + i) - imageBase);
+
+                const std::int64_t relative = static_cast<std::int64_t>(offset) -
+                    static_cast<std::int64_t>(carry.size()) + static_cast<std::int64_t>(i);
+                if (relative >= 0 && static_cast<SIZE_T>(relative) < size) {
+                    const DWORD rva = static_cast<DWORD>((address + relative) - imageBase);
                     Log(L"HASHREF: section=%S name=%S hash=0x%08X rva=0x%08X address=%p bytes=%S",
-                        sectionName, kHashProbeTargets[t].name, value, rva, current + i, context);
-                    ++printed[t];
+                        sectionName, kHashProbeTargets[t].name, value, rva,
+                        address + relative, context);
                 }
+                ++printed[t];
             }
         }
-        offset += regionBytes;
+
+        if (scanData.size() >= sizeof(std::uint32_t) - 1) {
+            carry.assign(scanData.end() - (sizeof(std::uint32_t) - 1), scanData.end());
+        } else {
+            carry = scanData;
+        }
+
+        totalRead += bytesRead;
+        if (!readOk || bytesRead != requested) {
+            Log(L"HASHSCAN_PARTIAL_READ: section=%S offset=0x%llX requested=0x%llX received=0x%llX error=%lu",
+                sectionName, static_cast<unsigned long long>(offset),
+                static_cast<unsigned long long>(requested),
+                static_cast<unsigned long long>(bytesRead), GetLastError());
+            totalSkipped += requested - bytesRead;
+            carry.clear();
+        }
+        offset += requested;
+
+        if (offset - lastProgress >= 16 * 1024 * 1024 || offset == size) {
+            Log(L"HASHSCAN_PROGRESS: section=%S offset=0x%llX/%0llX read=0x%llX skipped=0x%llX",
+                sectionName, static_cast<unsigned long long>(offset),
+                static_cast<unsigned long long>(size),
+                static_cast<unsigned long long>(totalRead),
+                static_cast<unsigned long long>(totalSkipped));
+            lastProgress = offset;
+        }
     }
 
     for (size_t t = 0; t < _countof(kHashProbeTargets); ++t) {
@@ -255,6 +346,10 @@ void ScanExecutableSectionForHashes(const char* sectionName, const BYTE* address
                 static_cast<unsigned long long>(counts[t]), printed[t]);
         }
     }
+
+    Log(L"HASHSCAN_SECTION_END: %S read=0x%llX skipped=0x%llX",
+        sectionName, static_cast<unsigned long long>(totalRead),
+        static_cast<unsigned long long>(totalSkipped));
 }
 
 void ScanExecutableSectionsForHashes() {
@@ -275,7 +370,11 @@ void ScanExecutableSectionsForHashes() {
         const BYTE* address = base + section->VirtualAddress;
         Log(L"HASHSCAN_SECTION: %S rva=0x%08X size=0x%08X", name,
             section->VirtualAddress, static_cast<DWORD>(section->Misc.VirtualSize));
-        ScanExecutableSectionForHashes(name, address, section->Misc.VirtualSize, base);
+        try {
+            ScanExecutableSectionForHashes(name, address, section->Misc.VirtualSize, base);
+        } catch (...) {
+            Log(L"HASHSCAN_SECTION_EXCEPTION: %S", name);
+        }
     }
     Log(L"=== HASH SCAN END ===");
 }
