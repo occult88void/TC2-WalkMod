@@ -120,6 +120,15 @@ void LogFingerprint(const char* sectionName, const BYTE* address, SIZE_T size) {
     std::vector<BYTE> buffer(chunkSize);
 
     while (offset < size) {
+        if (GetTickCount64() >= scanDeadline) {
+            Log(L"HASHSCAN_TIMEOUT: section=%S offset=0x%llX/%0llX read=0x%llX skipped=0x%llX",
+                sectionName, static_cast<unsigned long long>(offset),
+                static_cast<unsigned long long>(size),
+                static_cast<unsigned long long>(totalRead),
+                static_cast<unsigned long long>(totalSkipped));
+            break;
+        }
+
         MEMORY_BASIC_INFORMATION mbi{};
         const BYTE* current = address + offset;
         if (VirtualQuery(current, &mbi, sizeof(mbi)) != sizeof(mbi) ||
@@ -197,7 +206,8 @@ constexpr HashProbeTarget kHashProbeTargets[] = {
 };
 
 void ScanExecutableSectionForHashes(const char* sectionName, const BYTE* address,
-                                    SIZE_T size, const BYTE* imageBase) {
+                                    SIZE_T size, const BYTE* imageBase,
+                                    ULONGLONG scanDeadline) {
     std::uint64_t counts[_countof(kHashProbeTargets)]{};
     unsigned printed[_countof(kHashProbeTargets)]{};
     SIZE_T offset = 0;
@@ -361,7 +371,8 @@ void ScanExecutableSectionsForHashes() {
     const auto nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
     if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return;
 
-    Log(L"=== HASH SCAN BEGIN (read-only executable memory scan) ===");
+    Log(L"=== HASH SCAN BEGIN (read-only executable memory scan, 30s limit) ===");
+    const ULONGLONG scanDeadline = GetTickCount64() + 30000;
     const IMAGE_SECTION_HEADER* section = IMAGE_FIRST_SECTION(nt);
     for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
         if ((section->Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0 || section->Misc.VirtualSize == 0) continue;
@@ -371,10 +382,13 @@ void ScanExecutableSectionsForHashes() {
         Log(L"HASHSCAN_SECTION: %S rva=0x%08X size=0x%08X", name,
             section->VirtualAddress, static_cast<DWORD>(section->Misc.VirtualSize));
         try {
-            ScanExecutableSectionForHashes(name, address, section->Misc.VirtualSize, base);
+            ScanExecutableSectionForHashes(name, address, section->Misc.VirtualSize, base, scanDeadline);
         } catch (...) {
             Log(L"HASHSCAN_SECTION_EXCEPTION: %S", name);
         }
+    }
+    if (GetTickCount64() >= scanDeadline) {
+        Log(L"HASHSCAN: global time budget exhausted; remaining executable sections were not scanned");
     }
     Log(L"=== HASH SCAN END ===");
 }
