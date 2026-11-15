@@ -372,6 +372,7 @@ void ScanExecutableSectionsForHashes() {
     if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return;
 
     Log(L"=== HASH SCAN BEGIN (read-only executable memory scan, 30s limit) ===");
+    Log(L"HASHSCAN_POLICY: executable sections only; writable .data and non-executable data sections are intentionally excluded");
     const ULONGLONG scanDeadline = GetTickCount64() + 30000;
     const IMAGE_SECTION_HEADER* section = IMAGE_FIRST_SECTION(nt);
     for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
