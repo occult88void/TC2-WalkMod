@@ -379,6 +379,10 @@ void ScanExecutableSectionsForHashes() {
         char name[9]{};
         memcpy(name, section->Name, 8);
         const BYTE* address = base + section->VirtualAddress;
+        if (GetTickCount64() >= scanDeadline) {
+            Log(L"HASHSCAN_SECTION_NOT_STARTED: %S reason=global_time_budget_exhausted", name);
+            break;
+        }
         Log(L"HASHSCAN_SECTION: %S rva=0x%08X size=0x%08X", name,
             section->VirtualAddress, static_cast<DWORD>(section->Misc.VirtualSize));
         try {
