@@ -4,6 +4,7 @@
 #include <dinput.h>
 #include <bcrypt.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdarg>
 #include <cstdio>
