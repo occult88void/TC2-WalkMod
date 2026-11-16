@@ -812,38 +812,46 @@ void CaptureDescriptorTarget(const BYTE* imageBase, SIZE_T imageSize,
     for (SIZE_T offset = 0; offset + 16 <= descriptor.size(); offset += 8) {
         std::uint64_t pointer = 0;
         std::uint32_t count = 0;
-        std::uint32_t capacity = 0;
+        std::uint32_t secondary = 0;
         std::memcpy(&pointer, descriptor.data() + offset, sizeof(pointer));
         std::memcpy(&count, descriptor.data() + offset + 8, sizeof(count));
-        std::memcpy(&capacity, descriptor.data() + offset + 12, sizeof(capacity));
+        std::memcpy(&secondary, descriptor.data() + offset + 12, sizeof(secondary));
 
+        // The native merge routine reads [array+0] as a pointer and [array+8]
+        // as a 32-bit element count, then computes pointer + count * 8.
+        // The following dword is NOT a capacity field; treating it as one
+        // incorrectly rejects valid descriptors.
         if (!IsPlausibleHeapPointer(imageBase, imageSize, pointer) ||
-            count == 0 || count > 4096 || capacity < count || capacity > 8192) {
+            count == 0 || count > 4096) {
             continue;
         }
         if (std::find(seen.begin(), seen.end(), pointer) != seen.end()) continue;
 
+        const SIZE_T captureSize = static_cast<SIZE_T>(count) * sizeof(std::uint64_t);
         MEMORY_BASIC_INFORMATION mbi{};
         const BYTE* heapAddress = reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(pointer));
         if (VirtualQuery(heapAddress, &mbi, sizeof(mbi)) != sizeof(mbi) ||
             mbi.State != MEM_COMMIT || mbi.Type != MEM_PRIVATE || !IsReadableProtection(mbi.Protect)) {
-            Log(L"TARGET_HEAP_REF_SKIP: name=%s field=0x%llX pointer=%p count=%u capacity=%u reason=not_readable_private_memory",
-                label, static_cast<unsigned long long>(offset), heapAddress, count, capacity);
+            Log(L"TARGET_HEAP_REF_SKIP: name=%s field=0x%llX pointer=%p count=%u secondary=%u reason=not_readable_private_memory",
+                label, static_cast<unsigned long long>(offset), heapAddress, count, secondary);
             continue;
         }
 
         const BYTE* regionEnd = static_cast<const BYTE*>(mbi.BaseAddress) + mbi.RegionSize;
-        if (regionEnd <= heapAddress) continue;
-        SIZE_T captureSize = static_cast<SIZE_T>(regionEnd - heapAddress);
-        if (captureSize > 0x400) captureSize = 0x400;
-        if (captureSize < 16) continue;
+        if (regionEnd <= heapAddress ||
+            static_cast<SIZE_T>(regionEnd - heapAddress) < captureSize) {
+            Log(L"TARGET_HEAP_REF_SKIP: name=%s field=0x%llX pointer=%p count=%u secondary=%u requested=0x%llX reason=array_exceeds_readable_region",
+                label, static_cast<unsigned long long>(offset), heapAddress, count, secondary,
+                static_cast<unsigned long long>(captureSize));
+            continue;
+        }
 
         std::vector<BYTE> heapBytes(captureSize);
         bytesRead = 0;
         if (!ReadProcessMemory(GetCurrentProcess(), heapAddress, heapBytes.data(), captureSize, &bytesRead) ||
             bytesRead != captureSize) {
-            Log(L"TARGET_HEAP_REF_ERROR: name=%s field=0x%llX pointer=%p requested=0x%llX received=0x%llX error=%lu",
-                label, static_cast<unsigned long long>(offset), heapAddress,
+            Log(L"TARGET_HEAP_REF_ERROR: name=%s field=0x%llX pointer=%p count=%u secondary=%u requested=0x%llX received=0x%llX error=%lu",
+                label, static_cast<unsigned long long>(offset), heapAddress, count, secondary,
                 static_cast<unsigned long long>(captureSize),
                 static_cast<unsigned long long>(bytesRead), GetLastError());
             continue;
