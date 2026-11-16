@@ -1,22 +1,16 @@
 #include <windows.h>
 #include <winnt.h>
-#include <tlhelp32.h>
 #include <dinput.h>
-#include <bcrypt.h>
-
+#include <algorithm>
 #include <cstdint>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <utility>
 #include <vector>
 
-// Belt-and-suspenders: make MSVC link the Windows CNG library even if a
-// project-level linker setting is accidentally omitted.
-#pragma comment(lib, "bcrypt.lib")
-
 namespace {
-
 using DirectInput8CreateFn = HRESULT (WINAPI*)(HINSTANCE, DWORD, REFIID, LPVOID*, LPUNKNOWN);
 using DllCanUnloadNowFn = HRESULT (WINAPI*)();
 using DllGetClassObjectFn = HRESULT (WINAPI*)(REFCLSID, REFIID, LPVOID*);
@@ -24,7 +18,7 @@ using DllRegisterServerFn = HRESULT (WINAPI*)();
 using DllUnregisterServerFn = HRESULT (WINAPI*)();
 using GetdfDIJoystickFn = LPCDIDATAFORMAT (WINAPI*)();
 
-HMODULE g_original = nullptr;
+HMODULE g_systemDinput8 = nullptr;
 DirectInput8CreateFn g_DirectInput8Create = nullptr;
 DllCanUnloadNowFn g_DllCanUnloadNow = nullptr;
 DllGetClassObjectFn g_DllGetClassObject = nullptr;
@@ -32,21 +26,21 @@ DllRegisterServerFn g_DllRegisterServer = nullptr;
 DllUnregisterServerFn g_DllUnregisterServer = nullptr;
 GetdfDIJoystickFn g_GetdfDIJoystick = nullptr;
 
-std::wstring GetLogPath() {
-    wchar_t exePath[MAX_PATH]{};
-    DWORD length = GetModuleFileNameW(nullptr, exePath, MAX_PATH);
-    if (length == 0 || length >= MAX_PATH) {
-        return L"TC2_Walkmod.log";
-    }
-    std::wstring path(exePath, length);
-    const size_t slash = path.find_last_of(L"\\/");
-    if (slash != std::wstring::npos) {
-        path.resize(slash + 1);
-    } else {
-        path.clear();
-    }
-    path += L"TC2_Walkmod.log";
-    return path;
+constexpr DWORD kImageSize = 0x05F94000u;
+constexpr DWORD kImageTimestamp = 0x68D1CFB8u;
+constexpr SIZE_T kDescriptorSize = 0x200;
+constexpr SIZE_T kMaxArrayCount = 4096;
+constexpr SIZE_T kObjectSize = 0x100;
+
+std::wstring ExeDir() {
+    wchar_t path[MAX_PATH]{};
+    DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH);
+    if (!n || n >= MAX_PATH) return L".\\";
+    std::wstring p(path, n);
+    size_t slash = p.find_last_of(L"\\/");
+    if (slash == std::wstring::npos) return L".\\";
+    p.resize(slash + 1);
+    return p;
 }
 
 void Log(const wchar_t* format, ...) {
@@ -55,498 +49,329 @@ void Log(const wchar_t* format, ...) {
     va_start(args, format);
     _vsnwprintf_s(message, _countof(message), _TRUNCATE, format, args);
     va_end(args);
+    int needed = WideCharToMultiByte(CP_UTF8, 0, message, -1, nullptr, 0, nullptr, nullptr);
+    if (needed <= 1) return;
+    std::vector<char> utf8(static_cast<size_t>(needed));
+    if (WideCharToMultiByte(CP_UTF8, 0, message, -1, utf8.data(), needed, nullptr, nullptr) <= 0) return;
+    FILE* f = nullptr;
+    std::wstring path = ExeDir() + L"TC2_Walkmod.log";
+    if (_wfopen_s(&f, path.c_str(), L"ab") != 0 || !f) return;
+    if (_fseeki64(f, 0, SEEK_END) == 0 && _ftelli64(f) == 0) {
+        const unsigned char bom[] = {0xEF, 0xBB, 0xBF};
+        fwrite(bom, 1, sizeof(bom), f);
+    }
+    fwrite(utf8.data(), 1, static_cast<size_t>(needed - 1), f);
+    fwrite("\r\n", 1, 2, f);
+    fclose(f);
+}
 
-    // Write explicit UTF-8 bytes instead of relying on the CRT's wide-file
-    // encoding mode. This prevents the log from appearing as CJK/mojibake
-    // when copied between Windows tools.
-    const int required = WideCharToMultiByte(CP_UTF8, 0, message, -1, nullptr, 0, nullptr, nullptr);
-    if (required <= 1) return;
-    std::vector<char> utf8(static_cast<size_t>(required));
-    if (WideCharToMultiByte(CP_UTF8, 0, message, -1, utf8.data(), required, nullptr, nullptr) <= 0) return;
+bool ReadMemory(const void* address, void* output, SIZE_T size) {
+    SIZE_T received = 0;
+    return ReadProcessMemory(GetCurrentProcess(), address, output, size, &received) != FALSE && received == size;
+}
 
-    const std::wstring path = GetLogPath();
-    FILE* file = nullptr;
-    if (_wfopen_s(&file, path.c_str(), L"ab") == 0 && file) {
-        if (_fseeki64(file, 0, SEEK_END) == 0 && _ftelli64(file) == 0) {
-            static const unsigned char bom[] = { 0xEF, 0xBB, 0xBF };
-            fwrite(bom, 1, sizeof(bom), file);
-        }
-        fwrite(utf8.data(), 1, static_cast<size_t>(required - 1), file);
-        fwrite("\r\n", 1, 2, file);
-        fclose(file);
+bool Readable(DWORD protect) {
+    if ((protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) return false;
+    switch (protect & 0xFF) {
+        case PAGE_READONLY: case PAGE_READWRITE: case PAGE_WRITECOPY:
+        case PAGE_EXECUTE_READ: case PAGE_EXECUTE_READWRITE: case PAGE_EXECUTE_WRITECOPY:
+            return true;
+        default: return false;
     }
 }
 
-bool IsReadableProtection(DWORD protection) {
-    if ((protection & PAGE_GUARD) || (protection & PAGE_NOACCESS)) {
+bool WriteFileBytes(const std::wstring& path, const BYTE* data, SIZE_T size) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+                           FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        Log(L"CAPTURE_FILE_ERROR: file=%s error=%lu", path.c_str(), GetLastError());
         return false;
     }
-    const DWORD base = protection & 0xFF;
-    return base == PAGE_READONLY || base == PAGE_READWRITE ||
-           base == PAGE_WRITECOPY || base == PAGE_EXECUTE_READ ||
-           base == PAGE_EXECUTE_READWRITE || base == PAGE_EXECUTE_WRITECOPY;
-}
-
-void LogFingerprint(const char* sectionName, const BYTE* address, SIZE_T size) {
-    BCRYPT_ALG_HANDLE algorithm = nullptr;
-    BCRYPT_HASH_HANDLE hash = nullptr;
-    DWORD objectLength = 0;
-    DWORD bytesCopied = 0;
-    NTSTATUS status = BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
-    if (status < 0) {
-        Log(L"FINGERPRINT: %S status=BCryptOpenAlgorithmProvider error=0x%08X", sectionName, static_cast<unsigned>(status));
-        return;
-    }
-
-    status = BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH,
-        reinterpret_cast<PUCHAR>(&objectLength), sizeof(objectLength), &bytesCopied, 0);
-    if (status < 0 || objectLength == 0) {
-        Log(L"FINGERPRINT: %S status=BCryptGetProperty error=0x%08X", sectionName, static_cast<unsigned>(status));
-        BCryptCloseAlgorithmProvider(algorithm, 0);
-        return;
-    }
-
-    std::vector<BYTE> hashObject(objectLength);
-    status = BCryptCreateHash(algorithm, &hash, hashObject.data(), objectLength, nullptr, 0, 0);
-    if (status < 0) {
-        Log(L"FINGERPRINT: %S status=BCryptCreateHash error=0x%08X", sectionName, static_cast<unsigned>(status));
-        BCryptCloseAlgorithmProvider(algorithm, 0);
-        return;
-    }
-
-    bool complete = true;
     SIZE_T offset = 0;
-    constexpr SIZE_T chunkSize = 64 * 1024;
-    std::vector<BYTE> buffer(chunkSize);
-
+    bool ok = true;
     while (offset < size) {
+        DWORD part = static_cast<DWORD>((size - offset > 1024 * 1024) ? 1024 * 1024 : size - offset);
+        DWORD written = 0;
+        if (!WriteFile(h, data + offset, part, &written, nullptr) || written != part) {
+            ok = false;
+            break;
+        }
+        offset += written;
+    }
+    if (ok && !FlushFileBuffers(h)) ok = false;
+    CloseHandle(h);
+    if (!ok) DeleteFileW(path.c_str());
+    return ok;
+}
+
+std::wstring NewCaptureDirectory() {
+    std::wstring root = ExeDir() + L"TC2_runtime_capture";
+    if (!CreateDirectoryW(root.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) {
+        Log(L"CAPTURE_DIRECTORY_ERROR: %s error=%lu", root.c_str(), GetLastError());
+        return L"";
+    }
+    wchar_t leaf[80]{};
+    swprintf_s(leaf, L"capture_%lu_%llu", GetCurrentProcessId(),
+               static_cast<unsigned long long>(GetTickCount64()));
+    std::wstring dir = root + L"\\" + leaf;
+    if (!CreateDirectoryW(dir.c_str(), nullptr)) {
+        Log(L"CAPTURE_DIRECTORY_ERROR: %s error=%lu", dir.c_str(), GetLastError());
+        return L"";
+    }
+    return dir;
+}
+
+struct Target { const wchar_t* name; DWORD rva; };
+struct ObjectRef { std::uint64_t address; std::vector<std::wstring> sources; };
+
+bool PlausiblePointer(const BYTE* image, SIZE_T imageSize, std::uint64_t value) {
+    if (value < 0x10000000000ull || value >= 0x0000800000000000ull || (value & 7ull)) return false;
+    const std::uint64_t start = reinterpret_cast<std::uint64_t>(image);
+    return value < start || value >= start + imageSize;
+}
+
+void AddObject(std::vector<ObjectRef>& objects, std::uint64_t address, const std::wstring& source) {
+    auto it = std::find_if(objects.begin(), objects.end(),
+        [address](const ObjectRef& item) { return item.address == address; });
+    if (it == objects.end()) {
+        ObjectRef item{};
+        item.address = address;
+        item.sources.push_back(source);
+        objects.push_back(std::move(item));
+    } else if (std::find(it->sources.begin(), it->sources.end(), source) == it->sources.end()) {
+        it->sources.push_back(source);
+    }
+}
+
+void CaptureObjects(const std::vector<ObjectRef>& objects, const std::wstring& dir) {
+    Log(L"=== TARGET REFERENCED OBJECT CAPTURE BEGIN (read-only) ===");
+    Log(L"TARGET_OBJECT_CANDIDATES: unique=%llu", static_cast<unsigned long long>(objects.size()));
+    unsigned captured = 0, skipped = 0;
+    for (const auto& item : objects) {
+        const BYTE* address = reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(item.address));
         MEMORY_BASIC_INFORMATION mbi{};
-        const BYTE* current = address + offset;
-        if (VirtualQuery(current, &mbi, sizeof(mbi)) != sizeof(mbi) ||
-            mbi.State != MEM_COMMIT || !IsReadableProtection(mbi.Protect)) {
-            complete = false;
-            break;
+        if (VirtualQuery(address, &mbi, sizeof(mbi)) != sizeof(mbi) ||
+            mbi.State != MEM_COMMIT || mbi.Type != MEM_PRIVATE || !Readable(mbi.Protect)) {
+            ++skipped;
+            Log(L"TARGET_OBJECT_SKIP: address=%p reason=not_readable_private_memory", address);
+            continue;
         }
-
-        const BYTE* regionEnd = static_cast<const BYTE*>(mbi.BaseAddress) + mbi.RegionSize;
-        if (regionEnd <= current) {
-            complete = false;
-            break;
+        const BYTE* end = static_cast<const BYTE*>(mbi.BaseAddress) + mbi.RegionSize;
+        if (end <= address) { ++skipped; continue; }
+        SIZE_T available = static_cast<SIZE_T>(end - address);
+        SIZE_T size = available < kObjectSize ? available : kObjectSize;
+        if (size < 0x40) { ++skipped; continue; }
+        std::vector<BYTE> bytes(size);
+        if (!ReadMemory(address, bytes.data(), size)) {
+            ++skipped;
+            Log(L"TARGET_OBJECT_READ_ERROR: address=%p error=%lu", address, GetLastError());
+            continue;
         }
-        const SIZE_T available = static_cast<SIZE_T>(regionEnd - current);
-        const SIZE_T regionBytes = (size - offset < available) ? (size - offset) : available;
-        const SIZE_T part = (regionBytes > chunkSize) ? chunkSize : regionBytes;
-
-        SIZE_T bytesRead = 0;
-        if (!ReadProcessMemory(GetCurrentProcess(), current, buffer.data(), part, &bytesRead) ||
-            bytesRead != part) {
-            Log(L"FINGERPRINT: %S read failed offset=0x%llX requested=0x%llX received=0x%llX error=%lu",
-                sectionName, static_cast<unsigned long long>(offset),
-                static_cast<unsigned long long>(part),
-                static_cast<unsigned long long>(bytesRead), GetLastError());
-            complete = false;
-            break;
-        }
-
-        status = BCryptHashData(hash, buffer.data(), static_cast<ULONG>(bytesRead), 0);
-        if (status < 0) {
-            complete = false;
-            break;
-        }
-        offset += bytesRead;
+        wchar_t name[96]{};
+        swprintf_s(name, L"object_%03u_%016llX.bin", captured, static_cast<unsigned long long>(item.address));
+        if (!WriteFileBytes(dir + L"\\" + name, bytes.data(), bytes.size())) { ++skipped; continue; }
+        Log(L"TARGET_OBJECT_OK: address=%p captured=0x%llX sources=%llu file=%s",
+            address, static_cast<unsigned long long>(size),
+            static_cast<unsigned long long>(item.sources.size()), name);
+        for (const auto& src : item.sources) Log(L"TARGET_OBJECT_SOURCE: address=%p source=%s", address, src.c_str());
+        ++captured;
     }
-
-    BYTE digest[32]{};
-    if (complete && offset == size) {
-        status = BCryptFinishHash(hash, digest, sizeof(digest), 0);
-        if (status >= 0) {
-            wchar_t hex[65]{};
-            for (size_t i = 0; i < sizeof(digest); ++i) {
-                swprintf_s(hex + i * 2, 3, L"%02X", digest[i]);
-            }
-            Log(L"FINGERPRINT: %S size=0x%llX sha256=%s", sectionName,
-                static_cast<unsigned long long>(size), hex);
-        } else {
-            Log(L"FINGERPRINT: %S status=BCryptFinishHash error=0x%08X", sectionName, static_cast<unsigned>(status));
-        }
-    } else {
-        Log(L"FINGERPRINT: %S incomplete offset=0x%llX size=0x%llX",
-            sectionName, static_cast<unsigned long long>(offset), static_cast<unsigned long long>(size));
-    }
-
-    BCryptDestroyHash(hash);
-    BCryptCloseAlgorithmProvider(algorithm, 0);
+    Log(L"TARGET_OBJECT_SUMMARY: candidates=%llu captured=%u skipped=%u",
+        static_cast<unsigned long long>(objects.size()), captured, skipped);
+    Log(L"=== TARGET REFERENCED OBJECT CAPTURE END ===");
 }
 
+void CaptureDescriptor(const BYTE* image, SIZE_T imageSize, const Target& target,
+                       const std::wstring& dir, std::vector<ObjectRef>& objects) {
+    if (target.rva > imageSize || kDescriptorSize > imageSize - target.rva) {
+        Log(L"TARGET_DESCRIPTOR_ERROR: name=%s reason=outside_image", target.name);
+        return;
+    }
+    std::vector<BYTE> descriptor(kDescriptorSize);
+    if (!ReadMemory(image + target.rva, descriptor.data(), descriptor.size())) {
+        Log(L"TARGET_DESCRIPTOR_ERROR: name=%s reason=read_failed error=%lu", target.name, GetLastError());
+        return;
+    }
+    std::wstring descriptorFile = std::wstring(target.name) + L"_descriptor.bin";
+    if (!WriteFileBytes(dir + L"\\" + descriptorFile, descriptor.data(), descriptor.size())) return;
+    Log(L"TARGET_DESCRIPTOR_OK: name=%s rva=0x%08X size=0x%llX file=%s",
+        target.name, target.rva, static_cast<unsigned long long>(descriptor.size()), descriptorFile.c_str());
 
-struct HashProbeTarget {
-    const char* name;
-    std::uint32_t value;
-};
+    std::vector<std::uint64_t> seen;
+    unsigned arrays = 0;
+    for (SIZE_T off = 0; off + 16 <= descriptor.size(); off += 8) {
+        std::uint64_t pointer = 0;
+        std::uint32_t count = 0, secondary = 0;
+        memcpy(&pointer, descriptor.data() + off, 8);
+        memcpy(&count, descriptor.data() + off + 8, 4);
+        memcpy(&secondary, descriptor.data() + off + 12, 4);
+        if (!PlausiblePointer(image, imageSize, pointer) || count == 0 || count > kMaxArrayCount) continue;
+        if (std::find(seen.begin(), seen.end(), pointer) != seen.end()) continue;
 
-constexpr HashProbeTarget kHashProbeTargets[] = {
-    { "CITEntityAvatarTC2", 0x2155AD67u },
-    { "CITEntityAvatarSettings", 0x20F54DA4u },
-    { "PlayerCharacterSetting", 0x31D9280Du },
-    { "CITEntityHeadQuarterCharacterSpawnPoint", 0xAE884E8Fu },
-    { "CITEntityHeadQuarterExitPoint", 0x5AA79419u },
-    { "CMissionAtomSpawn", 0x430810CAu },
-    { "CMissionAtomGetLocalPlayer", 0xB0B2E4E7u },
-    { "CMissionAtomTeleportEntity", 0x5D01241Du },
-    { "CMissionAtomDisablePedestrian", 0x80E55B58u },
-};
-
-void ScanReadableSectionForHashes(const char* sectionName, const BYTE* address,
-                                    SIZE_T size, const BYTE* imageBase,
-                                    ULONGLONG scanDeadline) {
-    std::uint64_t counts[_countof(kHashProbeTargets)]{};
-    unsigned printed[_countof(kHashProbeTargets)]{};
-    SIZE_T offset = 0;
-    SIZE_T lastProgress = 0;
-    std::uint64_t totalRead = 0;
-    std::uint64_t totalSkipped = 0;
-    bool timedOut = false;
-    constexpr SIZE_T chunkSize = 64 * 1024;
-    std::vector<BYTE> carry;
-    carry.reserve(sizeof(std::uint32_t) - 1);
-
-    Log(L"HASHSCAN_SECTION_BEGIN: %S size=0x%llX chunk=0x%llX",
-        sectionName, static_cast<unsigned long long>(size),
-        static_cast<unsigned long long>(chunkSize));
-
-    while (offset < size) {
-        if (GetTickCount64() >= scanDeadline) {
-            timedOut = true;
-            Log(L"HASHSCAN_TIMEOUT: section=%S offset=0x%llX/%0llX read=0x%llX skipped=0x%llX",
-                sectionName, static_cast<unsigned long long>(offset),
-                static_cast<unsigned long long>(size),
-                static_cast<unsigned long long>(totalRead),
-                static_cast<unsigned long long>(totalSkipped));
-            break;
-        }
-
+        SIZE_T bytesNeeded = static_cast<SIZE_T>(count) * sizeof(std::uint64_t);
+        const BYTE* array = reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(pointer));
         MEMORY_BASIC_INFORMATION mbi{};
-        const BYTE* current = address + offset;
-        if (VirtualQuery(current, &mbi, sizeof(mbi)) != sizeof(mbi)) {
-            const SIZE_T step = (size - offset > 0x1000) ? 0x1000 : (size - offset);
-            Log(L"HASHSCAN_SKIP: section=%S offset=0x%llX reason=VirtualQuery_failed error=%lu",
-                sectionName, static_cast<unsigned long long>(offset), GetLastError());
-            offset += step;
-            totalSkipped += step;
-            carry.clear();
+        if (VirtualQuery(array, &mbi, sizeof(mbi)) != sizeof(mbi) ||
+            mbi.State != MEM_COMMIT || mbi.Type != MEM_PRIVATE || !Readable(mbi.Protect)) {
+            Log(L"TARGET_HEAP_REF_SKIP: name=%s field=0x%llX pointer=%p count=%u reason=not_readable_private_memory",
+                target.name, static_cast<unsigned long long>(off), array, count);
             continue;
         }
-
-        const BYTE* regionEnd = static_cast<const BYTE*>(mbi.BaseAddress) + mbi.RegionSize;
-        if (regionEnd <= current) {
-            const SIZE_T step = (size - offset > 0x1000) ? 0x1000 : (size - offset);
-            Log(L"HASHSCAN_SKIP: section=%S offset=0x%llX reason=invalid_region",
-                sectionName, static_cast<unsigned long long>(offset));
-            offset += step;
-            totalSkipped += step;
-            carry.clear();
+        const BYTE* end = static_cast<const BYTE*>(mbi.BaseAddress) + mbi.RegionSize;
+        if (end <= array || static_cast<SIZE_T>(end - array) < bytesNeeded) {
+            Log(L"TARGET_HEAP_REF_SKIP: name=%s field=0x%llX pointer=%p count=%u reason=array_exceeds_region",
+                target.name, static_cast<unsigned long long>(off), array, count);
             continue;
         }
-
-        const SIZE_T available = static_cast<SIZE_T>(regionEnd - current);
-        const SIZE_T regionBytes = (size - offset < available) ? (size - offset) : available;
-        if (mbi.State != MEM_COMMIT || !IsReadableProtection(mbi.Protect)) {
-            Log(L"HASHSCAN_SKIP: section=%S offset=0x%llX bytes=0x%llX state=0x%lX protect=0x%08X",
-                sectionName, static_cast<unsigned long long>(offset),
-                static_cast<unsigned long long>(regionBytes), mbi.State, mbi.Protect);
-            offset += regionBytes;
-            totalSkipped += regionBytes;
-            carry.clear();
+        std::vector<BYTE> contents(bytesNeeded);
+        if (!ReadMemory(array, contents.data(), bytesNeeded)) {
+            Log(L"TARGET_HEAP_REF_ERROR: name=%s field=0x%llX error=%lu",
+                target.name, static_cast<unsigned long long>(off), GetLastError());
             continue;
         }
-
-        const SIZE_T requested = (regionBytes > chunkSize) ? chunkSize : regionBytes;
-        std::vector<BYTE> block(requested);
-        SIZE_T bytesRead = 0;
-        const BOOL readOk = ReadProcessMemory(GetCurrentProcess(), current,
-            block.data(), requested, &bytesRead);
-        if (bytesRead == 0) {
-            Log(L"HASHSCAN_READ_ERROR: section=%S offset=0x%llX requested=0x%llX error=%lu",
-                sectionName, static_cast<unsigned long long>(offset),
-                static_cast<unsigned long long>(requested), GetLastError());
-            offset += requested;
-            totalSkipped += requested;
-            carry.clear();
-            continue;
+        for (SIZE_T i = 0; i < count; ++i) {
+            std::uint64_t candidate = 0;
+            memcpy(&candidate, contents.data() + i * 8, 8);
+            if (!PlausiblePointer(image, imageSize, candidate)) continue;
+            wchar_t source[160]{};
+            swprintf_s(source, L"%s.field_%03llX.element_%llu", target.name,
+                       static_cast<unsigned long long>(off), static_cast<unsigned long long>(i));
+            AddObject(objects, candidate, source);
         }
-
-        std::vector<BYTE> scanData;
-        scanData.reserve(carry.size() + bytesRead);
-        scanData.insert(scanData.end(), carry.begin(), carry.end());
-        scanData.insert(scanData.end(), block.begin(), block.begin() + bytesRead);
-
-        for (SIZE_T i = 0; i + sizeof(std::uint32_t) <= scanData.size(); ++i) {
-            std::uint32_t value = 0;
-            std::memcpy(&value, scanData.data() + i, sizeof(value));
-            size_t t = _countof(kHashProbeTargets);
-            switch (value) {
-                case 0x2155AD67u: t = 0; break;
-                case 0x20F54DA4u: t = 1; break;
-                case 0x31D9280Du: t = 2; break;
-                case 0xAE884E8Fu: t = 3; break;
-                case 0x5AA79419u: t = 4; break;
-                case 0x430810CAu: t = 5; break;
-                case 0xB0B2E4E7u: t = 6; break;
-                case 0x5D01241Du: t = 7; break;
-                case 0x80E55B58u: t = 8; break;
-                default: break;
-            }
-            if (t == _countof(kHashProbeTargets)) continue;
-
-            ++counts[t];
-            if (printed[t] < 8) {
-                char context[36 * 3 + 1]{};
-                const SIZE_T contextStart = (i > 16) ? (i - 16) : 0;
-                const SIZE_T contextEnd = ((i + 16 + 4 + 16) < scanData.size()) ? (i + 16 + 4 + 16) : scanData.size();
-                SIZE_T cursor = 0;
-                for (SIZE_T j = contextStart; j < contextEnd; ++j) {
-                    const int written = sprintf_s(context + cursor, sizeof(context) - cursor,
-                        "%02X%s", static_cast<unsigned>(scanData[j]),
-                        (j + 1 < contextEnd) ? " " : "");
-                    if (written <= 0) break;
-                    cursor += static_cast<SIZE_T>(written);
-                }
-
-                const std::int64_t relative = static_cast<std::int64_t>(offset) -
-                    static_cast<std::int64_t>(carry.size()) + static_cast<std::int64_t>(i);
-                if (relative >= 0 && static_cast<SIZE_T>(relative) < size) {
-                    const DWORD rva = static_cast<DWORD>((address + relative) - imageBase);
-                    Log(L"HASHREF: section=%S name=%S hash=0x%08X rva=0x%08X address=%p bytes=%S",
-                        sectionName, kHashProbeTargets[t].name, value, rva,
-                        address + relative, context);
-                }
-                ++printed[t];
-            }
-        }
-
-        if (scanData.size() >= sizeof(std::uint32_t) - 1) {
-            carry.assign(scanData.end() - (sizeof(std::uint32_t) - 1), scanData.end());
-        } else {
-            carry = scanData;
-        }
-
-        totalRead += bytesRead;
-        if (!readOk || bytesRead != requested) {
-            Log(L"HASHSCAN_PARTIAL_READ: section=%S offset=0x%llX requested=0x%llX received=0x%llX error=%lu",
-                sectionName, static_cast<unsigned long long>(offset),
-                static_cast<unsigned long long>(requested),
-                static_cast<unsigned long long>(bytesRead), GetLastError());
-            totalSkipped += requested - bytesRead;
-            carry.clear();
-        }
-        offset += requested;
-
-        if (offset - lastProgress >= 16 * 1024 * 1024 || offset == size) {
-            Log(L"HASHSCAN_PROGRESS: section=%S offset=0x%llX/%0llX read=0x%llX skipped=0x%llX",
-                sectionName, static_cast<unsigned long long>(offset),
-                static_cast<unsigned long long>(size),
-                static_cast<unsigned long long>(totalRead),
-                static_cast<unsigned long long>(totalSkipped));
-            lastProgress = offset;
-        }
+        wchar_t arrayFile[128]{};
+        swprintf_s(arrayFile, L"%s_ref_%02u_field_%03llX.bin", target.name, arrays,
+                   static_cast<unsigned long long>(off));
+        if (!WriteFileBytes(dir + L"\\" + arrayFile, contents.data(), contents.size())) continue;
+        seen.push_back(pointer);
+        Log(L"TARGET_HEAP_REF_OK: name=%s field=0x%llX pointer=%p count=%u secondary=%u captured=0x%llX file=%s",
+            target.name, static_cast<unsigned long long>(off), array, count, secondary,
+            static_cast<unsigned long long>(bytesNeeded), arrayFile);
+        ++arrays;
     }
-
-    for (size_t t = 0; t < _countof(kHashProbeTargets); ++t) {
-        if (counts[t] != 0) {
-            Log(L"HASHSCAN: section=%S name=%S total=%llu logged=%u",
-                sectionName, kHashProbeTargets[t].name,
-                static_cast<unsigned long long>(counts[t]), printed[t]);
-        }
-    }
-
-    const wchar_t* sectionStatus = timedOut ? L"TIMEOUT" : (totalSkipped ? L"PARTIAL" : L"COMPLETE");
-    Log(L"HASHSCAN_SECTION_END: %S read=0x%llX skipped=0x%llX status=%s",
-        sectionName, static_cast<unsigned long long>(totalRead),
-        static_cast<unsigned long long>(totalSkipped), sectionStatus);
+    Log(L"TARGET_DESCRIPTOR_SUMMARY: name=%s heap_arrays_captured=%u", target.name, arrays);
 }
 
-void ScanReadableSectionsForHashes() {
-    HMODULE image = GetModuleHandleW(nullptr);
-    if (!image) return;
-    const BYTE* base = reinterpret_cast<const BYTE*>(image);
-    const auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
-    const auto nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return;
-
-    Log(L"=== HASH SCAN BEGIN (read-only executable + .rdata/.data scan, 30s limit) ===");
-    const ULONGLONG scanDeadline = GetTickCount64() + 30000;
-    const IMAGE_SECTION_HEADER* section = IMAGE_FIRST_SECTION(nt);
-    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
-        if (section->Misc.VirtualSize == 0) continue;
-        char name[9]{};
-        memcpy(name, section->Name, 8);
-        const bool executable = (section->Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0;
-        const bool namedData = (strcmp(name, ".rdata") == 0 || strcmp(name, ".data") == 0);
-        if (!executable && !namedData) continue;
-
-        const BYTE* address = base + section->VirtualAddress;
-        if (GetTickCount64() >= scanDeadline) {
-            Log(L"HASHSCAN_SECTION_NOT_STARTED: %S reason=global_time_budget_exhausted", name);
-            break;
+bool WaitForHotkey() {
+    Log(L"CAPTURE_TRIGGER: enter Freedrive and press Ctrl+Shift+F10 once; waiting up to 10 minutes");
+    ULONGLONG deadline = GetTickCount64() + 10ull * 60ull * 1000ull;
+    bool wasDown = false;
+    while (GetTickCount64() < deadline) {
+        bool f10 = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
+        bool mods = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0 &&
+                    (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+        if (f10 && !wasDown && mods) {
+            Log(L"CAPTURE_TRIGGERED: Ctrl+Shift+F10");
+            return true;
         }
-        Log(L"HASHSCAN_SECTION: %S kind=%s rva=0x%08X size=0x%08X", name,
-            executable ? L"EXECUTABLE" : L"DATA",
-            section->VirtualAddress, static_cast<DWORD>(section->Misc.VirtualSize));
-        try {
-            ScanReadableSectionForHashes(name, address, section->Misc.VirtualSize, base, scanDeadline);
-        } catch (...) {
-            Log(L"HASHSCAN_SECTION_EXCEPTION: %S", name);
-        }
+        wasDown = f10;
+        Sleep(50);
     }
-    if (GetTickCount64() >= scanDeadline) {
-        Log(L"HASHSCAN: global time budget exhausted; remaining selected sections were not scanned");
-    }
-    Log(L"=== HASH SCAN END ===");
+    Log(L"CAPTURE_TRIGGER_TIMEOUT: no hotkey within 10 minutes");
+    return false;
 }
 
-void LogImageInfo() {
-    HMODULE image = GetModuleHandleW(nullptr);
-    if (!image) {
-        Log(L"IMAGE: GetModuleHandleW(nullptr) failed error=%lu", GetLastError());
+void RunCapture() {
+    HMODULE module = GetModuleHandleW(nullptr);
+    if (!module) { Log(L"TARGET_CAPTURE_ABORT: main module unavailable"); return; }
+    const BYTE* image = reinterpret_cast<const BYTE*>(module);
+    IMAGE_DOS_HEADER dos{};
+    if (!ReadMemory(image, &dos, sizeof(dos)) || dos.e_magic != IMAGE_DOS_SIGNATURE) {
+        Log(L"TARGET_CAPTURE_ABORT: invalid DOS header"); return;
+    }
+    IMAGE_NT_HEADERS64 nt{};
+    if (!ReadMemory(image + dos.e_lfanew, &nt, sizeof(nt)) ||
+        nt.Signature != IMAGE_NT_SIGNATURE || nt.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
+        nt.FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64) {
+        Log(L"TARGET_CAPTURE_ABORT: invalid PE64/AMD64 image"); return;
+    }
+    Log(L"TARGET_CAPTURE_IMAGE: base=%p size=0x%08X timestamp=0x%08X machine=0x%04X",
+        module, nt.OptionalHeader.SizeOfImage, nt.FileHeader.TimeDateStamp, nt.FileHeader.Machine);
+    if (nt.OptionalHeader.SizeOfImage != kImageSize || nt.FileHeader.TimeDateStamp != kImageTimestamp) {
+        Log(L"TARGET_CAPTURE_ABORT: executable fingerprint mismatch expected_size=0x%08X expected_timestamp=0x%08X",
+            kImageSize, kImageTimestamp);
         return;
     }
 
-    const BYTE* base = reinterpret_cast<const BYTE*>(image);
-    const auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
-        Log(L"IMAGE: invalid DOS signature");
-        return;
-    }
-    const auto nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
-        Log(L"IMAGE: invalid PE64 header");
-        return;
-    }
-
-    Log(L"IMAGE: base=%p image_size=0x%08X sections=%u timestamp=0x%08X machine=0x%04X",
-        image, nt->OptionalHeader.SizeOfImage, nt->FileHeader.NumberOfSections,
-        nt->FileHeader.TimeDateStamp, nt->FileHeader.Machine);
-
-    const IMAGE_SECTION_HEADER* section = IMAGE_FIRST_SECTION(nt);
-    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
-        char name[9]{};
-        memcpy(name, section->Name, 8);
-        const BYTE* address = base + section->VirtualAddress;
-        const SIZE_T virtualSize = section->Misc.VirtualSize;
-        MEMORY_BASIC_INFORMATION mbi{};
-        DWORD protection = 0;
-        DWORD state = 0;
-        if (VirtualQuery(address, &mbi, sizeof(mbi)) == sizeof(mbi)) {
-            protection = mbi.Protect;
-            state = mbi.State;
-        }
-        Log(L"SECTION: %S address=%p RVA=0x%08X virtual=0x%08X raw=0x%08X characteristics=0x%08X protection=0x%08X state=0x%lX",
-            name, address, section->VirtualAddress, static_cast<DWORD>(virtualSize),
-            section->SizeOfRawData, section->Characteristics, protection, state);
-
-        if ((section->Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0 && virtualSize != 0) {
-            LogFingerprint(name, address, virtualSize);
-        }
-    }
+    std::wstring dir = NewCaptureDirectory();
+    if (dir.empty()) return;
+    Log(L"TARGET_CAPTURE_DIRECTORY: %s", dir.c_str());
+    Log(L"=== TARGETED TYPE DESCRIPTOR CAPTURE BEGIN (read-only) ===");
+    const Target targets[] = {
+        {L"avatar_tc2", 0x0344F430u},
+        {L"human_player", 0x0342CCC8u},
+        {L"ghost_player", 0x0342CDE0u},
+        {L"avatar_parent_descriptor", 0x0386C3B0u},
+        {L"player_shared_parent_descriptor", 0x038AE500u},
+        {L"mission_spawn_registry", 0x038B7430u},
+    };
+    std::vector<ObjectRef> objects;
+    for (const auto& target : targets) CaptureDescriptor(image, nt.OptionalHeader.SizeOfImage, target, dir, objects);
+    CaptureObjects(objects, dir);
+    Log(L"=== TARGETED TYPE DESCRIPTOR CAPTURE END ===");
+    Log(L"TARGET_CAPTURE_COMPLETE: directory=%s", dir.c_str());
 }
 
-void LogModules() {
-    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetCurrentProcessId());
-    if (snapshot == INVALID_HANDLE_VALUE) {
-        Log(L"MODULES: snapshot failed error=%lu", GetLastError());
-        return;
-    }
-    MODULEENTRY32W entry{};
-    entry.dwSize = sizeof(entry);
-    if (Module32FirstW(snapshot, &entry)) {
-        do {
-            Log(L"MODULE: %s base=%p size=0x%08X path=%s",
-                entry.szModule, entry.modBaseAddr, entry.modBaseSize, entry.szExePath);
-        } while (Module32NextW(snapshot, &entry));
-    }
-    CloseHandle(snapshot);
-}
-
-DWORD WINAPI DiagnosticWorker(LPVOID) {
-    wchar_t exePath[MAX_PATH]{};
-    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
-    Log(L"=== TC2 Walkmod diagnostic bootstrap 07 (readable section hash probe) ===");
-    Log(L"Game executable: %s", exePath);
-    LogImageInfo();
-    LogModules();
-    Log(L"HASHSCAN: waiting 25 seconds for game initialization before scanning selected readable sections");
-    Sleep(25000);
-    ScanReadableSectionsForHashes();
+DWORD WINAPI Worker(LPVOID) {
+    wchar_t exe[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    Log(L"=== TC2 Walkmod diagnostic bootstrap 08 (referenced object capture) ===");
+    Log(L"BOOTSTRAP_VERSION: 08");
+    Log(L"Game executable: %s", exe);
+    if (WaitForHotkey()) RunCapture();
     return 0;
 }
 
 bool LoadOriginal() {
-    if (g_original) return true;
-    wchar_t systemDirectory[MAX_PATH]{};
-    UINT length = GetSystemDirectoryW(systemDirectory, MAX_PATH);
-    if (length == 0 || length >= MAX_PATH) {
-        Log(L"PROXY: GetSystemDirectoryW failed error=%lu", GetLastError());
-        return false;
-    }
-    std::wstring path(systemDirectory, length);
+    if (g_systemDinput8) return true;
+    wchar_t systemDir[MAX_PATH]{};
+    UINT n = GetSystemDirectoryW(systemDir, MAX_PATH);
+    if (!n || n >= MAX_PATH) { Log(L"PROXY_ERROR: GetSystemDirectoryW error=%lu", GetLastError()); return false; }
+    std::wstring path(systemDir, n);
     path += L"\\dinput8.dll";
-    g_original = LoadLibraryW(path.c_str());
-    if (!g_original) {
-        Log(L"PROXY: failed to load system dinput8.dll error=%lu", GetLastError());
-        return false;
-    }
-    g_DirectInput8Create = reinterpret_cast<DirectInput8CreateFn>(GetProcAddress(g_original, "DirectInput8Create"));
-    g_DllCanUnloadNow = reinterpret_cast<DllCanUnloadNowFn>(GetProcAddress(g_original, "DllCanUnloadNow"));
-    g_DllGetClassObject = reinterpret_cast<DllGetClassObjectFn>(GetProcAddress(g_original, "DllGetClassObject"));
-    g_DllRegisterServer = reinterpret_cast<DllRegisterServerFn>(GetProcAddress(g_original, "DllRegisterServer"));
-    g_DllUnregisterServer = reinterpret_cast<DllUnregisterServerFn>(GetProcAddress(g_original, "DllUnregisterServer"));
-    g_GetdfDIJoystick = reinterpret_cast<GetdfDIJoystickFn>(GetProcAddress(g_original, "GetdfDIJoystick"));
-    Log(L"PROXY: original System32 dinput8.dll loaded %s", g_DirectInput8Create ? L"successfully" : L"but DirectInput8Create export is missing");
-    return g_DirectInput8Create != nullptr;
+    g_systemDinput8 = LoadLibraryW(path.c_str());
+    if (!g_systemDinput8) { Log(L"PROXY_ERROR: System32 dinput8.dll load failed error=%lu", GetLastError()); return false; }
+    g_DirectInput8Create = reinterpret_cast<DirectInput8CreateFn>(GetProcAddress(g_systemDinput8, "DirectInput8Create"));
+    g_DllCanUnloadNow = reinterpret_cast<DllCanUnloadNowFn>(GetProcAddress(g_systemDinput8, "DllCanUnloadNow"));
+    g_DllGetClassObject = reinterpret_cast<DllGetClassObjectFn>(GetProcAddress(g_systemDinput8, "DllGetClassObject"));
+    g_DllRegisterServer = reinterpret_cast<DllRegisterServerFn>(GetProcAddress(g_systemDinput8, "DllRegisterServer"));
+    g_DllUnregisterServer = reinterpret_cast<DllUnregisterServerFn>(GetProcAddress(g_systemDinput8, "DllUnregisterServer"));
+    g_GetdfDIJoystick = reinterpret_cast<GetdfDIJoystickFn>(GetProcAddress(g_systemDinput8, "GetdfDIJoystick"));
+    bool ok = g_DirectInput8Create && g_DllCanUnloadNow && g_DllGetClassObject &&
+              g_DllRegisterServer && g_DllUnregisterServer && g_GetdfDIJoystick;
+    Log(L"PROXY: System32 dinput8.dll loaded; required_exports=%s", ok ? L"all_present" : L"missing");
+    return ok;
 }
-
 } // namespace
 
-extern "C" HRESULT WINAPI DirectInput8Create(HINSTANCE instance, DWORD version, REFIID riid, LPVOID* output, LPUNKNOWN outer) {
+extern "C" HRESULT WINAPI DirectInput8Create(HINSTANCE a, DWORD b, REFIID c, LPVOID* d, LPUNKNOWN e) {
     if (!LoadOriginal() || !g_DirectInput8Create) return E_FAIL;
-    Log(L"DirectInput8Create called");
-    const HRESULT result = g_DirectInput8Create(instance, version, riid, output, outer);
-    Log(L"DirectInput8Create HRESULT=0x%08X", static_cast<unsigned>(result));
-    return result;
+    return g_DirectInput8Create(a, b, c, d, e);
 }
-
 extern "C" HRESULT WINAPI DllCanUnloadNow() {
     if (!LoadOriginal() || !g_DllCanUnloadNow) return S_FALSE;
     return g_DllCanUnloadNow();
 }
-
-extern "C" HRESULT WINAPI DllGetClassObject(REFCLSID clsid, REFIID iid, LPVOID* output) {
+extern "C" HRESULT WINAPI DllGetClassObject(REFCLSID a, REFIID b, LPVOID* c) {
     if (!LoadOriginal() || !g_DllGetClassObject) return CLASS_E_CLASSNOTAVAILABLE;
-    return g_DllGetClassObject(clsid, iid, output);
+    return g_DllGetClassObject(a, b, c);
 }
-
 extern "C" HRESULT WINAPI DllRegisterServer() {
     if (!LoadOriginal() || !g_DllRegisterServer) return E_FAIL;
     return g_DllRegisterServer();
 }
-
 extern "C" HRESULT WINAPI DllUnregisterServer() {
     if (!LoadOriginal() || !g_DllUnregisterServer) return E_FAIL;
     return g_DllUnregisterServer();
 }
-
 extern "C" LPCDIDATAFORMAT WINAPI GetdfDIJoystick() {
     if (!LoadOriginal() || !g_GetdfDIJoystick) return nullptr;
     return g_GetdfDIJoystick();
 }
-
 BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(instance);
-        HANDLE worker = CreateThread(nullptr, 0, DiagnosticWorker, nullptr, 0, nullptr);
-        if (worker) CloseHandle(worker);
+        HANDLE thread = CreateThread(nullptr, 0, Worker, nullptr, 0, nullptr);
+        if (thread) CloseHandle(thread);
     }
     return TRUE;
 }
-
