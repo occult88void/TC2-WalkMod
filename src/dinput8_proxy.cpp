@@ -864,8 +864,8 @@ void CaptureDescriptorTarget(const BYTE* imageBase, SIZE_T imageSize,
         if (!WriteCaptureFile(heapPath, heapBytes.data(), heapBytes.size())) continue;
 
         seen.push_back(pointer);
-        Log(L"TARGET_HEAP_REF_OK: name=%s field=0x%llX pointer=%p count=%u capacity=%u captured=0x%llX file=%s",
-            label, static_cast<unsigned long long>(offset), heapAddress, count, capacity,
+        Log(L"TARGET_HEAP_REF_OK: name=%s field=0x%llX pointer=%p count=%u secondary=%u captured=0x%llX file=%s",
+            label, static_cast<unsigned long long>(offset), heapAddress, count, secondary,
             static_cast<unsigned long long>(captureSize), heapPath.c_str());
         ++capturedRefs;
     }
