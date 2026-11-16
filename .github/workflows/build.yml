@@ -4,7 +4,7 @@ name: Build TC2 Walkmod bootstrap
 on:
   workflow_dispatch:
   push:
-    branches: [ main, master, starter-06-safe-scan, starter-07-readable-sections, starter-08-referenced-object-capture ]
+    branches: [ main, master, starter-06-safe-scan, starter-07-readable-sections, starter-08-referenced-object-capture, analysis-05-native-lifecycle-ver09 ]
 
 jobs:
   build:
