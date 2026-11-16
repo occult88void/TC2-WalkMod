@@ -1,5 +1,6 @@
 #include <windows.h>
 #include <winnt.h>
+#include <bcrypt.h>
 #include <dinput.h>
 #include <algorithm>
 #include <cstdint>
@@ -270,6 +271,148 @@ bool WaitForHotkey() {
     return false;
 }
 
+
+struct CodeTarget { const wchar_t* name; DWORD rva; SIZE_T size; };
+
+bool IsExecutableRange(const BYTE* image, const IMAGE_NT_HEADERS64& nt, DWORD rva, SIZE_T size) {
+    auto* actualNt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(image +
+        reinterpret_cast<const IMAGE_DOS_HEADER*>(image)->e_lfanew);
+    const IMAGE_SECTION_HEADER* section = IMAGE_FIRST_SECTION(actualNt);
+    for (WORD i = 0; i < nt.FileHeader.NumberOfSections; ++i, ++section) {
+        const DWORD span = (std::max)(section->Misc.VirtualSize, section->SizeOfRawData);
+        if (rva >= section->VirtualAddress &&
+            static_cast<std::uint64_t>(rva) + size <=
+                static_cast<std::uint64_t>(section->VirtualAddress) + span &&
+            (section->Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0) return true;
+    }
+    return false;
+}
+
+bool CaptureWindow(const BYTE* address, SIZE_T requested, const std::wstring& path,
+                   const wchar_t* tag) {
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(address, &mbi, sizeof(mbi)) != sizeof(mbi) ||
+        mbi.State != MEM_COMMIT || !Readable(mbi.Protect)) {
+        Log(L"VER09_WINDOW_SKIP: tag=%s address=%p reason=not_readable", tag, address);
+        return false;
+    }
+    const BYTE* end = static_cast<const BYTE*>(mbi.BaseAddress) + mbi.RegionSize;
+    if (end <= address) return false;
+    SIZE_T size = (std::min)(requested, static_cast<SIZE_T>(end - address));
+    if (size < 8) {
+        Log(L"VER09_WINDOW_SKIP: tag=%s address=%p reason=short_region size=0x%llX",
+            tag, address, static_cast<unsigned long long>(size));
+        return false;
+    }
+    std::vector<BYTE> bytes(size);
+    if (!ReadMemory(address, bytes.data(), size)) {
+        Log(L"VER09_WINDOW_READ_ERROR: tag=%s address=%p error=%lu", tag, address, GetLastError());
+        return false;
+    }
+    if (!WriteFileBytes(path, bytes.data(), bytes.size())) return false;
+    std::uint64_t first = 0, second = 0;
+    memcpy(&first, bytes.data(), 8);
+    if (bytes.size() >= 16) memcpy(&second, bytes.data() + 8, 8);
+    Log(L"VER09_WINDOW_OK: tag=%s address=%p size=0x%llX qword0=%016llX qword1=%016llX file=%s",
+        tag, address, static_cast<unsigned long long>(size),
+        static_cast<unsigned long long>(first), static_cast<unsigned long long>(second),
+        path.c_str());
+    return true;
+}
+
+void CaptureNativeCode(const BYTE* image, SIZE_T imageSize, const IMAGE_NT_HEADERS64& nt,
+                       const std::wstring& dir) {
+    Log(L"=== VER09 NATIVE LIFECYCLE CODE WINDOWS BEGIN (read-only) ===");
+    const CodeTarget targets[] = {
+        {L"destroy_current_vehicle_avatar_mode", 0x001FA430u, 0x180},
+        {L"spawn_replica_vehicle",               0x001FA530u, 0x180},
+        {L"avatar_vehicle_lifecycle_caller",     0x00204800u, 0x600},
+        {L"vehicle_cleanup_helper",              0x00841100u, 0x240},
+        {L"vehicle_cleanup_helper_inner",        0x00841780u, 0x300},
+    };
+    unsigned captured = 0, skipped = 0;
+    for (const auto& target : targets) {
+        if (target.rva > imageSize || target.size > imageSize - target.rva ||
+            !IsExecutableRange(image, nt, target.rva, target.size)) {
+            ++skipped;
+            Log(L"VER09_CODE_SKIP: name=%s rva=0x%08X size=0x%llX reason=not_executable_or_outside_image",
+                target.name, target.rva, static_cast<unsigned long long>(target.size));
+            continue;
+        }
+        std::vector<BYTE> bytes(target.size);
+        if (!ReadMemory(image + target.rva, bytes.data(), bytes.size())) {
+            ++skipped;
+            Log(L"VER09_CODE_READ_ERROR: name=%s rva=0x%08X error=%lu",
+                target.name, target.rva, GetLastError());
+            continue;
+        }
+        std::wstring file = std::wstring(target.name) + L"_rva_" +
+            std::to_wstring(target.rva) + L".bin";
+        if (!WriteFileBytes(dir + L"\\" + file, bytes.data(), bytes.size())) {
+            ++skipped;
+            continue;
+        }
+        std::uint64_t first = 0, second = 0;
+        memcpy(&first, bytes.data(), 8);
+        memcpy(&second, bytes.data() + 8, 8);
+        Log(L"VER09_CODE_OK: name=%s rva=0x%08X address=%p size=0x%llX qword0=%016llX qword1=%016llX file=%s",
+            target.name, target.rva, image + target.rva,
+            static_cast<unsigned long long>(bytes.size()),
+            static_cast<unsigned long long>(first), static_cast<unsigned long long>(second), file.c_str());
+        ++captured;
+    }
+    Log(L"VER09_CODE_SUMMARY: targets=%llu captured=%u skipped=%u",
+        static_cast<unsigned long long>(_countof(targets)), captured, skipped);
+    Log(L"=== VER09 NATIVE LIFECYCLE CODE WINDOWS END ===");
+}
+
+void CaptureManagerCandidate(const BYTE* image, SIZE_T imageSize, const std::wstring& dir) {
+    constexpr DWORD kGlobalPointerRva = 0x0343C630u;
+    constexpr SIZE_T kManagerWindowSize = 0x2000;
+    const DWORD fieldOffsets[] = {0x1DD8u, 0x1DE8u, 0x1E68u};
+    Log(L"=== VER09 GLOBAL MANAGER CANDIDATE BEGIN (read-only) ===");
+    if (kGlobalPointerRva > imageSize || sizeof(std::uint64_t) > imageSize - kGlobalPointerRva) {
+        Log(L"VER09_MANAGER_ABORT: global slot outside image");
+        return;
+    }
+    std::uint64_t manager = 0;
+    if (!ReadMemory(image + kGlobalPointerRva, &manager, sizeof(manager))) {
+        Log(L"VER09_MANAGER_ABORT: global slot read failed error=%lu", GetLastError());
+        return;
+    }
+    WriteFileBytes(dir + L"\\manager_global_slot_rva_0343C630.bin",
+                   reinterpret_cast<const BYTE*>(&manager), sizeof(manager));
+    Log(L"VER09_MANAGER_GLOBAL_SLOT: rva=0x%08X address=%p value=%016llX",
+        kGlobalPointerRva, image + kGlobalPointerRva, static_cast<unsigned long long>(manager));
+    if (!PlausiblePointer(image, imageSize, manager)) {
+        Log(L"VER09_MANAGER_ABORT: global value is not a plausible external pointer");
+        return;
+    }
+    const BYTE* base = reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(manager));
+    if (!CaptureWindow(base, kManagerWindowSize, dir + L"\\manager_candidate_000002000.bin",
+                       L"manager_candidate_root")) {
+        Log(L"VER09_MANAGER_ABORT: root window unavailable");
+        return;
+    }
+    for (DWORD offset : fieldOffsets) {
+        std::uint64_t value = 0;
+        const BYTE* field = base + offset;
+        if (!ReadMemory(field, &value, sizeof(value))) {
+            Log(L"VER09_MANAGER_FIELD_SKIP: offset=0x%X reason=read_failed error=%lu", offset, GetLastError());
+            continue;
+        }
+        Log(L"VER09_MANAGER_FIELD: offset=0x%X address=%p value=%016llX",
+            offset, field, static_cast<unsigned long long>(value));
+        wchar_t name[96]{};
+        swprintf_s(name, L"manager_field_%04X_target.bin", offset);
+        if (PlausiblePointer(image, imageSize, value)) {
+            CaptureWindow(reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(value)),
+                          0x200, dir + L"\\" + name, L"manager_field_target");
+        }
+    }
+    Log(L"=== VER09 GLOBAL MANAGER CANDIDATE END ===");
+}
+
 void RunCapture() {
     HMODULE module = GetModuleHandleW(nullptr);
     if (!module) { Log(L"TARGET_CAPTURE_ABORT: main module unavailable"); return; }
@@ -308,14 +451,16 @@ void RunCapture() {
     for (const auto& target : targets) CaptureDescriptor(image, nt.OptionalHeader.SizeOfImage, target, dir, objects);
     CaptureObjects(objects, dir);
     Log(L"=== TARGETED TYPE DESCRIPTOR CAPTURE END ===");
+    CaptureNativeCode(image, nt.OptionalHeader.SizeOfImage, nt, dir);
+    CaptureManagerCandidate(image, nt.OptionalHeader.SizeOfImage, dir);
     Log(L"TARGET_CAPTURE_COMPLETE: directory=%s", dir.c_str());
 }
 
 DWORD WINAPI Worker(LPVOID) {
     wchar_t exe[MAX_PATH]{};
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
-    Log(L"=== TC2 Walkmod diagnostic bootstrap 08 (referenced object capture) ===");
-    Log(L"BOOTSTRAP_VERSION: 08");
+    Log(L"=== TC2 Walkmod diagnostic bootstrap 09 (native lifecycle capture) ===");
+    Log(L"BOOTSTRAP_VERSION: 09");
     Log(L"Game executable: %s", exe);
     if (WaitForHotkey()) RunCapture();
     return 0;
