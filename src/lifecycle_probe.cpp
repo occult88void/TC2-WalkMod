@@ -108,21 +108,24 @@ void LogFields(const wchar_t* tag, void* self, const DWORD* offsets, size_t coun
 
 void __fastcall HookDestroy(void* self) {
     const DWORD offsets[] = {0x18, 0x28, 0x54, 0x568, 0x570};
-    void* caller = _ReturnAddress();\n    LogFields(L"DestroyCurrentVehicleAvatarMode ENTER", self, offsets, _countof(offsets), caller);
+    void* caller = _ReturnAddress();
+    LogFields(L"DestroyCurrentVehicleAvatarMode ENTER", self, offsets, _countof(offsets), caller);
     g_destroyOriginal(self);
     LogFields(L"DestroyCurrentVehicleAvatarMode EXIT ", self, offsets, _countof(offsets), caller);
 }
 
 void __fastcall HookSpawn(void* self) {
     const DWORD offsets[] = {0x18, 0x28, 0x568, 0x570, 0x698, 0x6A8};
-    void* caller = _ReturnAddress();\n    LogFields(L"SpawnReplicaVehicle ENTER", self, offsets, _countof(offsets), caller);
+    void* caller = _ReturnAddress();
+    LogFields(L"SpawnReplicaVehicle ENTER", self, offsets, _countof(offsets), caller);
     g_spawnOriginal(self);
     LogFields(L"SpawnReplicaVehicle EXIT ", self, offsets, _countof(offsets), caller);
 }
 
 void __fastcall HookCleanup(void* self, std::uint32_t flags) {
     const DWORD offsets[] = {0x568, 0x570};
-    void* caller = _ReturnAddress();\n    LogFields(L"VehicleCleanupInner ENTER", self, offsets, _countof(offsets), caller);
+    void* caller = _ReturnAddress();
+    LogFields(L"VehicleCleanupInner ENTER", self, offsets, _countof(offsets), caller);
     ProbeLog(L"PROBE VehicleCleanupInner args tid=%lu flags=%08X", GetCurrentThreadId(), flags);
     g_cleanupOriginal(self, flags);
     LogFields(L"VehicleCleanupInner EXIT ", self, offsets, _countof(offsets), caller);
