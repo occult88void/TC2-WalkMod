@@ -15,6 +15,7 @@
 // Belt-and-suspenders: make MSVC link the Windows CNG library even if a
 // project-level linker setting is accidentally omitted.
 #pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "user32.lib")
 
 namespace {
 
