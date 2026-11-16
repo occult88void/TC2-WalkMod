@@ -91,12 +91,12 @@ bool HashExecutable(std::wstring& path, std::string& hex) {
     return true;
 }
 
-void LogFields(const wchar_t* tag, void* self, const DWORD* offsets, size_t count) {
+void LogFields(const wchar_t* tag, void* self, const DWORD* offsets, size_t count, void* caller) {
     wchar_t fields[1200]{};
     size_t used = 0;
     for (size_t i = 0; i < count; ++i) {
         std::uint64_t value = 0;
-        bool ok = ReadSafe(static_cast<BYTE*>(self) + offsets[i], &value, sizeof(value));
+        bool ok = self && ReadSafe(static_cast<BYTE*>(self) + offsets[i], &value, sizeof(value));
         int wrote = _snwprintf_s(fields + used, _countof(fields) - used, _TRUNCATE,
                                  L" +%03X=%s%016llX", offsets[i], ok ? L"" : L"?", 
                                  static_cast<unsigned long long>(value));
@@ -104,29 +104,29 @@ void LogFields(const wchar_t* tag, void* self, const DWORD* offsets, size_t coun
         if (used >= _countof(fields) - 64) break;
     }
     ProbeLog(L"PROBE %s tid=%lu this=%p ret=%p%s", tag, GetCurrentThreadId(), self,
-             _ReturnAddress(), fields);
+             caller, fields);
 }
 
 void __fastcall HookDestroy(void* self) {
     const DWORD offsets[] = {0x18, 0x28, 0x54, 0x568, 0x570};
-    LogFields(L"DestroyCurrentVehicleAvatarMode ENTER", self, offsets, _countof(offsets));
+    void* caller = _ReturnAddress();\n    LogFields(L"DestroyCurrentVehicleAvatarMode ENTER", self, offsets, _countof(offsets), caller);
     g_destroyOriginal(self);
-    LogFields(L"DestroyCurrentVehicleAvatarMode EXIT ", self, offsets, _countof(offsets));
+    LogFields(L"DestroyCurrentVehicleAvatarMode EXIT ", self, offsets, _countof(offsets), caller);
 }
 
 void __fastcall HookSpawn(void* self) {
     const DWORD offsets[] = {0x18, 0x28, 0x568, 0x570, 0x698, 0x6A8};
-    LogFields(L"SpawnReplicaVehicle ENTER", self, offsets, _countof(offsets));
+    void* caller = _ReturnAddress();\n    LogFields(L"SpawnReplicaVehicle ENTER", self, offsets, _countof(offsets), caller);
     g_spawnOriginal(self);
-    LogFields(L"SpawnReplicaVehicle EXIT ", self, offsets, _countof(offsets));
+    LogFields(L"SpawnReplicaVehicle EXIT ", self, offsets, _countof(offsets), caller);
 }
 
 void __fastcall HookCleanup(void* self, std::uint32_t flags) {
     const DWORD offsets[] = {0x568, 0x570};
-    LogFields(L"VehicleCleanupInner ENTER", self, offsets, _countof(offsets));
+    void* caller = _ReturnAddress();\n    LogFields(L"VehicleCleanupInner ENTER", self, offsets, _countof(offsets), caller);
     ProbeLog(L"PROBE VehicleCleanupInner args tid=%lu flags=%08X", GetCurrentThreadId(), flags);
     g_cleanupOriginal(self, flags);
-    LogFields(L"VehicleCleanupInner EXIT ", self, offsets, _countof(offsets));
+    LogFields(L"VehicleCleanupInner EXIT ", self, offsets, _countof(offsets), caller);
 }
 
 bool CheckPrologue(const BYTE* address, const BYTE* expected, size_t size) {
