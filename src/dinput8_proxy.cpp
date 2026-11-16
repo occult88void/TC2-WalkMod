@@ -528,6 +528,197 @@ void LogImageInfo() {
     }
 }
 
+
+std::wstring GetCaptureRoot() {
+    std::wstring path = GetLogPath();
+    const size_t slash = path.find_last_of(L"\\/");
+    if (slash != std::wstring::npos) path.resize(slash + 1);
+    else path.clear();
+    path += L"TC2_runtime_capture";
+    if (!CreateDirectoryW(path.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) {
+        Log(L"CAPTURE_ERROR: cannot create capture root error=%lu", GetLastError());
+        return L"";
+    }
+    path += L"\\capture_";
+    path += std::to_wstring(GetTickCount64());
+    if (!CreateDirectoryW(path.c_str(), nullptr)) {
+        Log(L"CAPTURE_ERROR: cannot create unique capture directory error=%lu", GetLastError());
+        return L"";
+    }
+    return path;
+}
+
+bool CaptureOneSection(const BYTE* imageBase, const IMAGE_SECTION_HEADER& section,
+                       const std::wstring& directory) {
+    char narrowName[9]{};
+    memcpy(narrowName, section.Name, 8);
+    wchar_t wideName[16]{};
+    if (MultiByteToWideChar(CP_ACP, 0, narrowName, -1, wideName, _countof(wideName)) <= 0) {
+        Log(L"CAPTURE_SECTION_ERROR: invalid section name");
+        return false;
+    }
+
+    const DWORD rva = section.VirtualAddress;
+    const SIZE_T size = section.Misc.VirtualSize;
+    if (size == 0) return true;
+
+    std::wstring filePath = directory + L"\\" + wideName + L".bin";
+    HANDLE output = CreateFileW(filePath.c_str(), GENERIC_WRITE, 0, nullptr,
+        CREATE_NEW, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (output == INVALID_HANDLE_VALUE) {
+        Log(L"CAPTURE_SECTION_ERROR: section=%s CreateFile error=%lu", wideName, GetLastError());
+        return false;
+    }
+
+    BCRYPT_ALG_HANDLE algorithm = nullptr;
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    DWORD objectLength = 0;
+    DWORD copied = 0;
+    NTSTATUS status = BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
+    if (status >= 0) {
+        status = BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH,
+            reinterpret_cast<PUCHAR>(&objectLength), sizeof(objectLength), &copied, 0);
+    }
+    std::vector<BYTE> hashObject;
+    if (status >= 0 && objectLength != 0) {
+        hashObject.resize(objectLength);
+        status = BCryptCreateHash(algorithm, &hash, hashObject.data(), objectLength, nullptr, 0, 0);
+    }
+
+    bool complete = status >= 0 && hash != nullptr;
+    SIZE_T offset = 0;
+    constexpr SIZE_T chunkSize = 1024 * 1024;
+    std::vector<BYTE> buffer(chunkSize);
+
+    while (complete && offset < size) {
+        const BYTE* current = imageBase + rva + offset;
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(current, &mbi, sizeof(mbi)) != sizeof(mbi) ||
+            mbi.State != MEM_COMMIT || !IsReadableProtection(mbi.Protect)) {
+            Log(L"CAPTURE_READ_ERROR: section=%s offset=0x%llX reason=uncommitted_or_unreadable",
+                wideName, static_cast<unsigned long long>(offset));
+            complete = false;
+            break;
+        }
+
+        const BYTE* regionEnd = static_cast<const BYTE*>(mbi.BaseAddress) + mbi.RegionSize;
+        if (regionEnd <= current) {
+            Log(L"CAPTURE_READ_ERROR: section=%s offset=0x%llX reason=invalid_memory_region",
+                wideName, static_cast<unsigned long long>(offset));
+            complete = false;
+            break;
+        }
+
+        const SIZE_T available = static_cast<SIZE_T>(regionEnd - current);
+        const SIZE_T remaining = size - offset;
+        const SIZE_T requested = (remaining < available)
+            ? ((remaining < chunkSize) ? remaining : chunkSize)
+            : ((available < chunkSize) ? available : chunkSize);
+
+        SIZE_T bytesRead = 0;
+        if (requested == 0 ||
+            !ReadProcessMemory(GetCurrentProcess(), current, buffer.data(), requested, &bytesRead) ||
+            bytesRead != requested) {
+            Log(L"CAPTURE_READ_ERROR: section=%s offset=0x%llX requested=0x%llX received=0x%llX error=%lu",
+                wideName, static_cast<unsigned long long>(offset),
+                static_cast<unsigned long long>(requested),
+                static_cast<unsigned long long>(bytesRead), GetLastError());
+            complete = false;
+            break;
+        }
+
+        status = BCryptHashData(hash, buffer.data(), static_cast<ULONG>(bytesRead), 0);
+        if (status < 0) {
+            Log(L"CAPTURE_HASH_ERROR: section=%s offset=0x%llX status=0x%08X",
+                wideName, static_cast<unsigned long long>(offset), static_cast<unsigned>(status));
+            complete = false;
+            break;
+        }
+
+        DWORD bytesWritten = 0;
+        if (!WriteFile(output, buffer.data(), static_cast<DWORD>(bytesRead), &bytesWritten, nullptr) ||
+            bytesWritten != bytesRead) {
+            Log(L"CAPTURE_WRITE_ERROR: section=%s offset=0x%llX requested=0x%llX written=0x%lX error=%lu",
+                wideName, static_cast<unsigned long long>(offset),
+                static_cast<unsigned long long>(bytesRead), bytesWritten, GetLastError());
+            complete = false;
+            break;
+        }
+        offset += bytesRead;
+    }
+
+    BYTE digest[32]{};
+    if (complete && offset == size) {
+        status = BCryptFinishHash(hash, digest, sizeof(digest), 0);
+        if (status < 0 || !FlushFileBuffers(output)) {
+            Log(L"CAPTURE_FINALIZE_ERROR: section=%s hash_status=0x%08X error=%lu",
+                wideName, static_cast<unsigned>(status), GetLastError());
+            complete = false;
+        }
+    } else {
+        complete = false;
+    }
+
+    if (hash) BCryptDestroyHash(hash);
+    if (algorithm) BCryptCloseAlgorithmProvider(algorithm, 0);
+    CloseHandle(output);
+
+    if (!complete) {
+        DeleteFileW(filePath.c_str());
+        Log(L"CAPTURE_SECTION_INCOMPLETE: section=%s captured=0x%llX expected=0x%llX partial_file_deleted",
+            wideName, static_cast<unsigned long long>(offset), static_cast<unsigned long long>(size));
+        return false;
+    }
+
+    wchar_t hex[65]{};
+    for (size_t i = 0; i < sizeof(digest); ++i) {
+        swprintf_s(hex + i * 2, 3, L"%02X", digest[i]);
+    }
+    Log(L"CAPTURE_SECTION_OK: section=%s RVA=0x%08X size=0x%llX sha256=%s file=%s",
+        wideName, rva, static_cast<unsigned long long>(size), hex, filePath.c_str());
+    return true;
+}
+
+void CaptureRuntimeSections() {
+    HMODULE image = GetModuleHandleW(nullptr);
+    if (!image) {
+        Log(L"CAPTURE_ERROR: main image handle unavailable");
+        return;
+    }
+    const BYTE* base = reinterpret_cast<const BYTE*>(image);
+    const auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+        Log(L"CAPTURE_ERROR: invalid DOS signature");
+        return;
+    }
+    const auto nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE ||
+        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+        Log(L"CAPTURE_ERROR: invalid PE64 header");
+        return;
+    }
+
+    const std::wstring directory = GetCaptureRoot();
+    if (directory.empty()) return;
+
+    Log(L"=== RUNTIME SECTION CAPTURE BEGIN (read-only) ===");
+    Log(L"CAPTURE_IMAGE: base=%p size=0x%08X section_count=%u directory=%s",
+        image, nt->OptionalHeader.SizeOfImage, nt->FileHeader.NumberOfSections, directory.c_str());
+
+    unsigned captured = 0;
+    unsigned failed = 0;
+    const IMAGE_SECTION_HEADER* section = IMAGE_FIRST_SECTION(nt);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
+        if (section->Misc.VirtualSize == 0) continue;
+        if (CaptureOneSection(base, *section, directory)) ++captured;
+        else ++failed;
+    }
+
+    Log(L"CAPTURE_SUMMARY: captured_sections=%u failed_sections=%u total_sections=%u",
+        captured, failed, nt->FileHeader.NumberOfSections);
+    Log(L"=== RUNTIME SECTION CAPTURE END ===");
+}
+
 void LogModules() {
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetCurrentProcessId());
     if (snapshot == INVALID_HANDLE_VALUE) {
@@ -554,6 +745,7 @@ DWORD WINAPI DiagnosticWorker(LPVOID) {
     LogModules();
     Log(L"HASHSCAN: waiting 25 seconds for game initialization before scanning executable sections");
     Sleep(25000);
+    CaptureRuntimeSections();
     ScanExecutableSectionsForHashes();
     DumpSpawnHashCodeWindow();
     return 0;
