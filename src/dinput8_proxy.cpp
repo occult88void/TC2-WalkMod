@@ -1,4 +1,5 @@
 #include <windows.h>
+#include "lifecycle_probe.h"
 #include <winnt.h>
 #include <dinput.h>
 #include <algorithm>
@@ -459,7 +460,8 @@ DWORD WINAPI Worker(LPVOID) {
     wchar_t exe[MAX_PATH]{};
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
     Log(L"=== TC2 Walkmod diagnostic bootstrap 09 (native lifecycle capture) ===");
-    Log(L"BOOTSTRAP_VERSION: 09");
+    Log(L"BOOTSTRAP_VERSION: 10");
+    InstallLifecycleProbe();
     Log(L"Game executable: %s", exe);
     if (WaitForHotkey()) RunCapture();
     return 0;
