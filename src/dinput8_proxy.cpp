@@ -388,7 +388,7 @@ void CaptureManagerCandidate(const BYTE* image, SIZE_T imageSize, const std::wst
         return;
     }
     const BYTE* base = reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(manager));
-    if (!CaptureWindow(base, kManagerWindowSize, dir + L"\\manager_candidate_000002000.bin",
+    if (!CaptureWindow(base, kManagerWindowSize, dir + L"\\manager_candidate_root.bin",
                        L"manager_candidate_root")) {
         Log(L"VER09_MANAGER_ABORT: root window unavailable");
         return;
