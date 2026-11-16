@@ -736,18 +736,207 @@ void LogModules() {
     CloseHandle(snapshot);
 }
 
+
+struct DescriptorTarget {
+    const char* label;
+    DWORD rva;
+};
+
+bool WriteCaptureFile(const std::wstring& path, const BYTE* bytes, SIZE_T size) {
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
+        CREATE_NEW, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        Log(L"TARGET_CAPTURE_WRITE_ERROR: file=%s error=%lu", path.c_str(), GetLastError());
+        return false;
+    }
+    SIZE_T offset = 0;
+    bool ok = true;
+    while (offset < size) {
+        const DWORD part = static_cast<DWORD>((size - offset > 1024 * 1024) ? 1024 * 1024 : size - offset);
+        DWORD written = 0;
+        if (!WriteFile(file, bytes + offset, part, &written, nullptr) || written != part) {
+            Log(L"TARGET_CAPTURE_WRITE_ERROR: file=%s offset=0x%llX error=%lu",
+                path.c_str(), static_cast<unsigned long long>(offset), GetLastError());
+            ok = false;
+            break;
+        }
+        offset += written;
+    }
+    if (ok && !FlushFileBuffers(file)) {
+        Log(L"TARGET_CAPTURE_FLUSH_ERROR: file=%s error=%lu", path.c_str(), GetLastError());
+        ok = false;
+    }
+    CloseHandle(file);
+    if (!ok) DeleteFileW(path.c_str());
+    return ok;
+}
+
+bool IsPlausibleHeapPointer(const BYTE* imageBase, SIZE_T imageSize, std::uint64_t value) {
+    if (value < 0x10000000000ull || value >= 0x0000800000000000ull || (value & 7ull) != 0) {
+        return false;
+    }
+    const std::uint64_t imageStart = reinterpret_cast<std::uint64_t>(imageBase);
+    return value < imageStart || value >= imageStart + imageSize;
+}
+
+void CaptureDescriptorTarget(const BYTE* imageBase, SIZE_T imageSize,
+                             const DescriptorTarget& target, const std::wstring& directory) {
+    constexpr SIZE_T descriptorSize = 0x200;
+    if (target.rva >= imageSize || descriptorSize > imageSize - target.rva) {
+        Log(L"TARGET_DESCRIPTOR_ERROR: name=%S reason=outside_image rva=0x%08X",
+            target.label, target.rva);
+        return;
+    }
+
+    std::vector<BYTE> descriptor(descriptorSize);
+    SIZE_T bytesRead = 0;
+    const BYTE* source = imageBase + target.rva;
+    if (!ReadProcessMemory(GetCurrentProcess(), source, descriptor.data(), descriptor.size(), &bytesRead) ||
+        bytesRead != descriptor.size()) {
+        Log(L"TARGET_DESCRIPTOR_ERROR: name=%S reason=read_failed received=0x%llX error=%lu",
+            target.label, static_cast<unsigned long long>(bytesRead), GetLastError());
+        return;
+    }
+
+    wchar_t label[64]{};
+    MultiByteToWideChar(CP_ACP, 0, target.label, -1, label, _countof(label));
+    const std::wstring descriptorPath = directory + L"\\" + label + L"_descriptor.bin";
+    if (!WriteCaptureFile(descriptorPath, descriptor.data(), descriptor.size())) return;
+    Log(L"TARGET_DESCRIPTOR_OK: name=%s RVA=0x%08X size=0x%llX file=%s",
+        label, target.rva, static_cast<unsigned long long>(descriptor.size()), descriptorPath.c_str());
+
+    std::vector<std::uint64_t> seen;
+    unsigned capturedRefs = 0;
+    for (SIZE_T offset = 0; offset + 16 <= descriptor.size(); offset += 8) {
+        std::uint64_t pointer = 0;
+        std::uint32_t count = 0;
+        std::uint32_t capacity = 0;
+        std::memcpy(&pointer, descriptor.data() + offset, sizeof(pointer));
+        std::memcpy(&count, descriptor.data() + offset + 8, sizeof(count));
+        std::memcpy(&capacity, descriptor.data() + offset + 12, sizeof(capacity));
+
+        if (!IsPlausibleHeapPointer(imageBase, imageSize, pointer) ||
+            count == 0 || count > 4096 || capacity < count || capacity > 8192) {
+            continue;
+        }
+        if (std::find(seen.begin(), seen.end(), pointer) != seen.end()) continue;
+
+        MEMORY_BASIC_INFORMATION mbi{};
+        const BYTE* heapAddress = reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(pointer));
+        if (VirtualQuery(heapAddress, &mbi, sizeof(mbi)) != sizeof(mbi) ||
+            mbi.State != MEM_COMMIT || mbi.Type != MEM_PRIVATE || !IsReadableProtection(mbi.Protect)) {
+            Log(L"TARGET_HEAP_REF_SKIP: name=%s field=0x%llX pointer=%p count=%u capacity=%u reason=not_readable_private_memory",
+                label, static_cast<unsigned long long>(offset), heapAddress, count, capacity);
+            continue;
+        }
+
+        const BYTE* regionEnd = static_cast<const BYTE*>(mbi.BaseAddress) + mbi.RegionSize;
+        if (regionEnd <= heapAddress) continue;
+        SIZE_T captureSize = static_cast<SIZE_T>(regionEnd - heapAddress);
+        if (captureSize > 0x400) captureSize = 0x400;
+        if (captureSize < 16) continue;
+
+        std::vector<BYTE> heapBytes(captureSize);
+        bytesRead = 0;
+        if (!ReadProcessMemory(GetCurrentProcess(), heapAddress, heapBytes.data(), captureSize, &bytesRead) ||
+            bytesRead != captureSize) {
+            Log(L"TARGET_HEAP_REF_ERROR: name=%s field=0x%llX pointer=%p requested=0x%llX received=0x%llX error=%lu",
+                label, static_cast<unsigned long long>(offset), heapAddress,
+                static_cast<unsigned long long>(captureSize),
+                static_cast<unsigned long long>(bytesRead), GetLastError());
+            continue;
+        }
+
+        wchar_t fileName[128]{};
+        swprintf_s(fileName, L"%s_ref_%02u_field_%03llX.bin", label, capturedRefs,
+            static_cast<unsigned long long>(offset));
+        const std::wstring heapPath = directory + L"\\" + fileName;
+        if (!WriteCaptureFile(heapPath, heapBytes.data(), heapBytes.size())) continue;
+
+        seen.push_back(pointer);
+        Log(L"TARGET_HEAP_REF_OK: name=%s field=0x%llX pointer=%p count=%u capacity=%u captured=0x%llX file=%s",
+            label, static_cast<unsigned long long>(offset), heapAddress, count, capacity,
+            static_cast<unsigned long long>(captureSize), heapPath.c_str());
+        ++capturedRefs;
+    }
+
+    Log(L"TARGET_DESCRIPTOR_SUMMARY: name=%s heap_arrays_captured=%u", label, capturedRefs);
+}
+
+bool WaitForDescriptorCaptureHotkey() {
+    Log(L"CAPTURE_TRIGGER: enter Freedrive and press Ctrl+Shift+F10 once; waiting up to 10 minutes");
+    const ULONGLONG deadline = GetTickCount64() + 10ull * 60ull * 1000ull;
+    bool f10WasDown = false;
+    while (GetTickCount64() < deadline) {
+        const bool f10Down = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
+        const bool modifiersDown =
+            (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0 &&
+            (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+        if (f10Down && !f10WasDown && modifiersDown) {
+            Log(L"CAPTURE_TRIGGERED: Ctrl+Shift+F10");
+            return true;
+        }
+        f10WasDown = f10Down;
+        Sleep(50);
+    }
+    Log(L"CAPTURE_TRIGGER_TIMEOUT: no hotkey received within 10 minutes");
+    return false;
+}
+
+void CaptureTargetedTypeDescriptors() {
+    HMODULE image = GetModuleHandleW(nullptr);
+    if (!image) {
+        Log(L"TARGET_CAPTURE_ERROR: main image handle unavailable");
+        return;
+    }
+    const BYTE* base = reinterpret_cast<const BYTE*>(image);
+    const auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+        Log(L"TARGET_CAPTURE_ERROR: invalid DOS signature");
+        return;
+    }
+    const auto nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE ||
+        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+        Log(L"TARGET_CAPTURE_ERROR: invalid PE64 header");
+        return;
+    }
+
+    Log(L"TARGET_CAPTURE_IMAGE: base=%p size=0x%08X timestamp=0x%08X",
+        image, nt->OptionalHeader.SizeOfImage, nt->FileHeader.TimeDateStamp);
+    if (nt->OptionalHeader.SizeOfImage != 0x05F94000u ||
+        nt->FileHeader.TimeDateStamp != 0x68D1CFB8u) {
+        Log(L"TARGET_CAPTURE_ABORT: executable fingerprint does not match analyzed build");
+        return;
+    }
+
+    const std::wstring directory = GetCaptureRoot();
+    if (directory.empty()) return;
+    Log(L"=== TARGETED TYPE DESCRIPTOR CAPTURE BEGIN (read-only) ===");
+    const DescriptorTarget targets[] = {
+        { "avatar_tc2", 0x0344F430u },
+        { "human_player", 0x0342CCC8u },
+        { "ghost_player", 0x0342CDE0u },
+        { "avatar_parent_descriptor", 0x0386C3B0u },
+        { "player_shared_parent_descriptor", 0x038AE500u },
+        { "mission_spawn_registry", 0x038B7430u },
+    };
+    for (const auto& target : targets) {
+        CaptureDescriptorTarget(base, nt->OptionalHeader.SizeOfImage, target, directory);
+    }
+    Log(L"=== TARGETED TYPE DESCRIPTOR CAPTURE END ===");
+}
+
 DWORD WINAPI DiagnosticWorker(LPVOID) {
     wchar_t exePath[MAX_PATH]{};
     GetModuleFileNameW(nullptr, exePath, MAX_PATH);
-    Log(L"=== TC2 Walkmod diagnostic bootstrap 06 (runtime hash probe) ===");
+    Log(L"=== TC2 Walkmod diagnostic bootstrap 07 (targeted descriptor capture) ===");
     Log(L"Game executable: %s", exePath);
     LogImageInfo();
     LogModules();
-    Log(L"HASHSCAN: waiting 25 seconds for game initialization before scanning executable sections");
-    Sleep(25000);
-    CaptureRuntimeSections();
-    ScanExecutableSectionsForHashes();
-    DumpSpawnHashCodeWindow();
+    if (WaitForDescriptorCaptureHotkey()) {
+        CaptureTargetedTypeDescriptors();
+    }
     return 0;
 }
 
