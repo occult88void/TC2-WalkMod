@@ -1,6 +1,5 @@
 #include "lifecycle_probe.h"
 
-#define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <bcrypt.h>
 #include <MinHook.h>
