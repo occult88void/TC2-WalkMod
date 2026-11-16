@@ -1,6 +1,5 @@
 #include <windows.h>
 #include <winnt.h>
-#include <bcrypt.h>
 #include <dinput.h>
 #include <algorithm>
 #include <cstdint>
