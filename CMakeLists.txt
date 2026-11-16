@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(TC2WalkModBootstrap LANGUAGES CXX)
+project(TC2WalkModBootstrap LANGUAGES C CXX)
 
 if(NOT WIN32)
     message(FATAL_ERROR "This project must be built on Windows.")
@@ -9,8 +9,17 @@ if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR "The Crew 2 requires the x64 build of this proxy.")
 endif()
 
+include(FetchContent)
+FetchContent_Declare(minhook
+    GIT_REPOSITORY https://github.com/TsudaKageyu/minhook.git
+    GIT_TAG v1.3.4
+    GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(minhook)
+
 add_library(dinput8 SHARED
     src/dinput8_proxy.cpp
+    src/lifecycle_probe.cpp
     src/dinput8.def
 )
 
@@ -24,7 +33,7 @@ target_compile_definitions(dinput8 PRIVATE
 )
 
 # bcrypt.lib is required for the BCrypt* SHA-256 functions used below.
-target_link_libraries(dinput8 PRIVATE bcrypt)
+target_link_libraries(dinput8 PRIVATE bcrypt minhook)
 
 set_target_properties(dinput8 PROPERTIES
     OUTPUT_NAME "dinput8"
