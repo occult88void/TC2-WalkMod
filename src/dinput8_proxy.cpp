@@ -744,6 +744,11 @@ struct DescriptorTarget {
     DWORD rva;
 };
 
+struct ReferencedObject {
+    std::uint64_t address;
+    std::vector<std::string> sources;
+};
+
 bool WriteCaptureFile(const std::wstring& path, const BYTE* bytes, SIZE_T size) {
     HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
         CREATE_NEW, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
@@ -782,7 +787,8 @@ bool IsPlausibleHeapPointer(const BYTE* imageBase, SIZE_T imageSize, std::uint64
 }
 
 void CaptureDescriptorTarget(const BYTE* imageBase, SIZE_T imageSize,
-                             const DescriptorTarget& target, const std::wstring& directory) {
+                             const DescriptorTarget& target, const std::wstring& directory,
+                             std::vector<ReferencedObject>& referencedObjects) {
     constexpr SIZE_T descriptorSize = 0x200;
     if (target.rva >= imageSize || descriptorSize > imageSize - target.rva) {
         Log(L"TARGET_DESCRIPTOR_ERROR: name=%S reason=outside_image rva=0x%08X",
@@ -857,6 +863,27 @@ void CaptureDescriptorTarget(const BYTE* imageBase, SIZE_T imageSize,
             continue;
         }
 
+        for (SIZE_T elementIndex = 0; elementIndex < count; ++elementIndex) {
+            std::uint64_t candidate = 0;
+            std::memcpy(&candidate, heapBytes.data() + elementIndex * sizeof(candidate), sizeof(candidate));
+            if (!IsPlausibleHeapPointer(imageBase, imageSize, candidate)) continue;
+
+            auto found = std::find_if(referencedObjects.begin(), referencedObjects.end(),
+                [candidate](const ReferencedObject& item) { return item.address == candidate; });
+            char source[160]{};
+            sprintf_s(source, "%S.field_%03llX.element_%llu", label,
+                static_cast<unsigned long long>(offset),
+                static_cast<unsigned long long>(elementIndex));
+            if (found == referencedObjects.end()) {
+                ReferencedObject item{};
+                item.address = candidate;
+                item.sources.emplace_back(source);
+                referencedObjects.emplace_back(std::move(item));
+            } else if (std::find(found->sources.begin(), found->sources.end(), source) == found->sources.end()) {
+                found->sources.emplace_back(source);
+            }
+        }
+
         wchar_t fileName[128]{};
         swprintf_s(fileName, L"%s_ref_%02u_field_%03llX.bin", label, capturedRefs,
             static_cast<unsigned long long>(offset));
@@ -871,6 +898,78 @@ void CaptureDescriptorTarget(const BYTE* imageBase, SIZE_T imageSize,
     }
 
     Log(L"TARGET_DESCRIPTOR_SUMMARY: name=%s heap_arrays_captured=%u", label, capturedRefs);
+}
+
+void CaptureReferencedObjects(const BYTE* imageBase, SIZE_T imageSize,
+                              const std::wstring& directory,
+                              const std::vector<ReferencedObject>& objects) {
+    constexpr SIZE_T preferredCaptureSize = 0x100;
+    Log(L"=== TARGET REFERENCED OBJECT CAPTURE BEGIN (read-only) ===");
+    Log(L"TARGET_OBJECT_CANDIDATES: unique=%llu",
+        static_cast<unsigned long long>(objects.size()));
+
+    unsigned captured = 0;
+    unsigned skipped = 0;
+    for (const auto& object : objects) {
+        const BYTE* address = reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(object.address));
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(address, &mbi, sizeof(mbi)) != sizeof(mbi) ||
+            mbi.State != MEM_COMMIT || mbi.Type != MEM_PRIVATE || !IsReadableProtection(mbi.Protect)) {
+            Log(L"TARGET_OBJECT_SKIP: address=%p reason=not_readable_private_memory sources=%llu",
+                address, static_cast<unsigned long long>(object.sources.size()));
+            ++skipped;
+            continue;
+        }
+
+        const BYTE* regionEnd = static_cast<const BYTE*>(mbi.BaseAddress) + mbi.RegionSize;
+        if (regionEnd <= address) {
+            Log(L"TARGET_OBJECT_SKIP: address=%p reason=invalid_region", address);
+            ++skipped;
+            continue;
+        }
+        const SIZE_T available = static_cast<SIZE_T>(regionEnd - address);
+        const SIZE_T captureSize = (available < preferredCaptureSize) ? available : preferredCaptureSize;
+        if (captureSize < 0x40) {
+            Log(L"TARGET_OBJECT_SKIP: address=%p reason=small_readable_tail available=0x%llX",
+                address, static_cast<unsigned long long>(available));
+            ++skipped;
+            continue;
+        }
+
+        std::vector<BYTE> bytes(captureSize);
+        SIZE_T bytesRead = 0;
+        if (!ReadProcessMemory(GetCurrentProcess(), address, bytes.data(), captureSize, &bytesRead) ||
+            bytesRead != captureSize) {
+            Log(L"TARGET_OBJECT_ERROR: address=%p requested=0x%llX received=0x%llX error=%lu",
+                address, static_cast<unsigned long long>(captureSize),
+                static_cast<unsigned long long>(bytesRead), GetLastError());
+            ++skipped;
+            continue;
+        }
+
+        wchar_t fileName[96]{};
+        swprintf_s(fileName, L"object_%03u_%016llX.bin", captured,
+            static_cast<unsigned long long>(object.address));
+        const std::wstring path = directory + L"\\" + fileName;
+        if (!WriteCaptureFile(path, bytes.data(), bytes.size())) {
+            ++skipped;
+            continue;
+        }
+
+        Log(L"TARGET_OBJECT_OK: address=%p captured=0x%llX sources=%llu file=%s",
+            address, static_cast<unsigned long long>(captureSize),
+            static_cast<unsigned long long>(object.sources.size()), path.c_str());
+        for (const auto& source : object.sources) {
+            wchar_t sourceWide[192]{};
+            MultiByteToWideChar(CP_ACP, 0, source.c_str(), -1, sourceWide, _countof(sourceWide));
+            Log(L"TARGET_OBJECT_SOURCE: address=%p source=%s", address, sourceWide);
+        }
+        ++captured;
+    }
+
+    Log(L"TARGET_OBJECT_SUMMARY: candidates=%llu captured=%u skipped=%u",
+        static_cast<unsigned long long>(objects.size()), captured, skipped);
+    Log(L"=== TARGET REFERENCED OBJECT CAPTURE END ===");
 }
 
 bool WaitForDescriptorCaptureHotkey() {
@@ -931,9 +1030,11 @@ void CaptureTargetedTypeDescriptors() {
         { "player_shared_parent_descriptor", 0x038AE500u },
         { "mission_spawn_registry", 0x038B7430u },
     };
+    std::vector<ReferencedObject> referencedObjects;
     for (const auto& target : targets) {
-        CaptureDescriptorTarget(base, nt->OptionalHeader.SizeOfImage, target, directory);
+        CaptureDescriptorTarget(base, nt->OptionalHeader.SizeOfImage, target, directory, referencedObjects);
     }
+    CaptureReferencedObjects(base, nt->OptionalHeader.SizeOfImage, directory, referencedObjects);
     Log(L"=== TARGETED TYPE DESCRIPTOR CAPTURE END ===");
 }
 
