@@ -251,22 +251,23 @@ void CaptureDescriptor(const BYTE* image, SIZE_T imageSize, const Target& target
     Log(L"TARGET_DESCRIPTOR_SUMMARY: name=%s heap_arrays_captured=%u", target.name, arrays);
 }
 
-bool WaitForHotkey() {
-    Log(L"CAPTURE_TRIGGER: enter Freedrive and press Ctrl+Shift+F10 once; waiting up to 10 minutes");
+bool WaitForHotkey(int key, const wchar_t* label) {
+    Log(L"SNAPSHOT_WAIT: label=%s hotkey=Ctrl+Shift+F%d timeout=10min",
+        label, key == VK_F10 ? 10 : (key == VK_F11 ? 11 : 12));
     ULONGLONG deadline = GetTickCount64() + 10ull * 60ull * 1000ull;
     bool wasDown = false;
     while (GetTickCount64() < deadline) {
-        bool f10 = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
+        bool keyDown = (GetAsyncKeyState(key) & 0x8000) != 0;
         bool mods = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0 &&
                     (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
-        if (f10 && !wasDown && mods) {
-            Log(L"CAPTURE_TRIGGERED: Ctrl+Shift+F10");
+        if (keyDown && !wasDown && mods) {
+            Log(L"SNAPSHOT_TRIGGERED: label=%s key=%d", label, key);
             return true;
         }
-        wasDown = f10;
+        wasDown = keyDown;
         Sleep(50);
     }
-    Log(L"CAPTURE_TRIGGER_TIMEOUT: no hotkey within 10 minutes");
+    Log(L"SNAPSHOT_TIMEOUT: label=%s key=%d", label, key);
     return false;
 }
 
@@ -412,30 +413,122 @@ void CaptureManagerCandidate(const BYTE* image, SIZE_T imageSize, const std::wst
     Log(L"=== VER09 GLOBAL MANAGER CANDIDATE END ===");
 }
 
-void RunCapture() {
+
+void CaptureComponentHostSnapshot(const BYTE* image, SIZE_T imageSize,
+                                  const wchar_t* label, const std::wstring& dir) {
+    constexpr DWORD kGlobalPointerRva = 0x0343C630u;
+    Log(L"=== COMPONENT HOST SNAPSHOT BEGIN label=%s (read-only) ===", label);
+    if (kGlobalPointerRva > imageSize || sizeof(std::uint64_t) > imageSize - kGlobalPointerRva) {
+        Log(L"COMPONENT_HOST_ABORT: label=%s reason=global_slot_outside_image", label);
+        return;
+    }
+
+    std::uint64_t host = 0;
+    if (!ReadMemory(image + kGlobalPointerRva, &host, sizeof(host)) ||
+        !PlausiblePointer(image, imageSize, host)) {
+        Log(L"COMPONENT_HOST_ABORT: label=%s reason=invalid_global_pointer value=%016llX",
+            label, static_cast<unsigned long long>(host));
+        return;
+    }
+
+    const BYTE* root = reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(host));
+    std::uint64_t table = 0, tableMeta = 0, selector = 0, selectorMeta = 0, cameraCandidate = 0;
+    const bool tableOk = ReadMemory(root + 0x1DD8, &table, sizeof(table));
+    const bool tableMetaOk = ReadMemory(root + 0x1DE0, &tableMeta, sizeof(tableMeta));
+    const bool selectorOk = ReadMemory(root + 0x1DE8, &selector, sizeof(selector));
+    const bool selectorMetaOk = ReadMemory(root + 0x1DF0, &selectorMeta, sizeof(selectorMeta));
+    ReadMemory(root + 0x1E68, &cameraCandidate, sizeof(cameraCandidate));
+
+    std::uint32_t count = static_cast<std::uint32_t>(tableMeta & 0xFFFFFFFFu);
+    if (count == 0 || count > 128) count = 128;
+
+    Log(L"COMPONENT_HOST_ROOT: label=%s host=%p table=%p tableMeta=%016llX selector=%p selectorMeta=%016llX field_1E68=%016llX count=%u",
+        label, root, reinterpret_cast<void*>(static_cast<std::uintptr_t>(table)),
+        static_cast<unsigned long long>(tableMeta),
+        reinterpret_cast<void*>(static_cast<std::uintptr_t>(selector)),
+        static_cast<unsigned long long>(selectorMeta),
+        static_cast<unsigned long long>(cameraCandidate), count);
+
+    std::wstring prefix = std::wstring(L"host_") + label;
+    CaptureWindow(root, 0x2000, dir + L"\\" + prefix + L"_root.bin", L"component_host_root");
+
+    if (tableOk && PlausiblePointer(image, imageSize, table)) {
+        CaptureWindow(reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(table)),
+                      static_cast<SIZE_T>(count) * sizeof(std::uint64_t),
+                      dir + L"\\" + prefix + L"_component_table.bin",
+                      L"component_host_pointer_table");
+    } else {
+        Log(L"COMPONENT_HOST_TABLE_SKIP: label=%s readable=%u pointer=%016llX",
+            label, tableOk ? 1 : 0, static_cast<unsigned long long>(table));
+    }
+
+    if (selectorOk && PlausiblePointer(image, imageSize, selector)) {
+        CaptureWindow(reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(selector)),
+                      0x400, dir + L"\\" + prefix + L"_selector_table.bin",
+                      L"component_host_selector_table");
+    } else {
+        Log(L"COMPONENT_HOST_SELECTOR_SKIP: label=%s readable=%u pointer=%016llX",
+            label, selectorOk ? 1 : 0, static_cast<unsigned long long>(selector));
+    }
+
+    if (PlausiblePointer(image, imageSize, cameraCandidate)) {
+        CaptureWindow(reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(cameraCandidate)),
+                      0x200, dir + L"\\" + prefix + L"_field_1E68_target.bin",
+                      L"component_host_field_1E68_target");
+    }
+
+    if (tableOk && PlausiblePointer(image, imageSize, table)) {
+        const BYTE* entries = reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(table));
+        for (std::uint32_t i = 0; i < count; ++i) {
+            std::uint64_t component = 0;
+            if (!ReadMemory(entries + static_cast<SIZE_T>(i) * sizeof(component),
+                            &component, sizeof(component))) break;
+            if (!PlausiblePointer(image, imageSize, component)) continue;
+
+            std::uint64_t vtable = 0, owner = 0;
+            const BYTE* object = reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(component));
+            ReadMemory(object, &vtable, sizeof(vtable));
+            ReadMemory(object + 0x18, &owner, sizeof(owner));
+
+            Log(L"COMPONENT_HOST_ENTRY: label=%s index=%u pointer=%016llX vtable=%016llX owner_plus_18=%016llX%s",
+                label, i, static_cast<unsigned long long>(component),
+                static_cast<unsigned long long>(vtable),
+                static_cast<unsigned long long>(owner),
+                i == 0x1C ? L" SLOT_1C_CANDIDATE_UNVERIFIED" : L"");
+
+            wchar_t file[128]{};
+            swprintf_s(file, L"%s_component_%03u.bin", label, i);
+            CaptureWindow(object, 0x100, dir + L"\\" + file, L"component_host_entry");
+        }
+    }
+
+    Log(L"=== COMPONENT HOST SNAPSHOT END label=%s ===", label);
+}
+
+std::wstring RunCapture() {
     HMODULE module = GetModuleHandleW(nullptr);
-    if (!module) { Log(L"TARGET_CAPTURE_ABORT: main module unavailable"); return; }
+    if (!module) { Log(L"TARGET_CAPTURE_ABORT: main module unavailable"); return L""; }
     const BYTE* image = reinterpret_cast<const BYTE*>(module);
     IMAGE_DOS_HEADER dos{};
     if (!ReadMemory(image, &dos, sizeof(dos)) || dos.e_magic != IMAGE_DOS_SIGNATURE) {
-        Log(L"TARGET_CAPTURE_ABORT: invalid DOS header"); return;
+        Log(L"TARGET_CAPTURE_ABORT: invalid DOS header"); return L"";
     }
     IMAGE_NT_HEADERS64 nt{};
     if (!ReadMemory(image + dos.e_lfanew, &nt, sizeof(nt)) ||
         nt.Signature != IMAGE_NT_SIGNATURE || nt.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
         nt.FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64) {
-        Log(L"TARGET_CAPTURE_ABORT: invalid PE64/AMD64 image"); return;
+        Log(L"TARGET_CAPTURE_ABORT: invalid PE64/AMD64 image"); return L"";
     }
     Log(L"TARGET_CAPTURE_IMAGE: base=%p size=0x%08X timestamp=0x%08X machine=0x%04X",
         module, nt.OptionalHeader.SizeOfImage, nt.FileHeader.TimeDateStamp, nt.FileHeader.Machine);
     if (nt.OptionalHeader.SizeOfImage != kImageSize || nt.FileHeader.TimeDateStamp != kImageTimestamp) {
         Log(L"TARGET_CAPTURE_ABORT: executable fingerprint mismatch expected_size=0x%08X expected_timestamp=0x%08X",
             kImageSize, kImageTimestamp);
-        return;
+        return L"";
     }
 
     std::wstring dir = NewCaptureDirectory();
-    if (dir.empty()) return;
+    if (dir.empty()) return L"";
     Log(L"TARGET_CAPTURE_DIRECTORY: %s", dir.c_str());
     Log(L"=== TARGETED TYPE DESCRIPTOR CAPTURE BEGIN (read-only) ===");
     const Target targets[] = {
@@ -451,17 +544,35 @@ void RunCapture() {
     CaptureObjects(objects, dir);
     Log(L"=== TARGETED TYPE DESCRIPTOR CAPTURE END ===");
     CaptureNativeCode(image, nt.OptionalHeader.SizeOfImage, nt, dir);
-    CaptureManagerCandidate(image, nt.OptionalHeader.SizeOfImage, dir);
+    CaptureComponentHostSnapshot(image, nt.OptionalHeader.SizeOfImage,
+                                 L"01_FREEDRIVE_VEHICLE", dir);
     Log(L"TARGET_CAPTURE_COMPLETE: directory=%s", dir.c_str());
+    return dir;
 }
 
 DWORD WINAPI Worker(LPVOID) {
     wchar_t exe[MAX_PATH]{};
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
-    Log(L"=== TC2 Walkmod diagnostic bootstrap 09 (native lifecycle capture) ===");
-    Log(L"BOOTSTRAP_VERSION: 09");
+    Log(L"=== TC2 Walkmod diagnostic bootstrap 11 (read-only component-host snapshots) ===");
+    Log(L"BOOTSTRAP_VERSION: 11");
+    Log(L"PROBE_MODE: read-only; no MinHook; no code patches; no memory writes to game");
     Log(L"Game executable: %s", exe);
-    if (WaitForHotkey()) RunCapture();
+
+    if (!WaitForHotkey(VK_F10, L"01_FREEDRIVE_VEHICLE")) return 0;
+    std::wstring dir = RunCapture();
+    if (dir.empty()) return 0;
+
+    if (WaitForHotkey(VK_F11, L"02_HQ_PEDESTRIAN")) {
+        HMODULE module = GetModuleHandleW(nullptr);
+        if (module) CaptureComponentHostSnapshot(reinterpret_cast<const BYTE*>(module),
+                                                   kImageSize, L"02_HQ_PEDESTRIAN", dir);
+    }
+    if (WaitForHotkey(VK_F12, L"03_OPEN_WORLD_PEDESTRIAN")) {
+        HMODULE module = GetModuleHandleW(nullptr);
+        if (module) CaptureComponentHostSnapshot(reinterpret_cast<const BYTE*>(module),
+                                                   kImageSize, L"03_OPEN_WORLD_PEDESTRIAN", dir);
+    }
+    Log(L"BOOTSTRAP11_SEQUENCE_COMPLETE: directory=%s", dir.c_str());
     return 0;
 }
 
