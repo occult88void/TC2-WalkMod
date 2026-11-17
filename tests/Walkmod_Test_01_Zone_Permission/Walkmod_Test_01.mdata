@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<metadata>
+  <names>
+    <English>Walkmod Test 01 - Zone Permission</English>
+  </names>
+  <author>Walkmod Research</author>
+  <descriptions>
+    <English>Controlled test of CITEntityGeographicalSpot.AllowedOutOfGameplayZone.</English>
+  </descriptions>
+  <files>
+    <file priority="996" loc="Walkmod_Test_01_AllowedOutOfGameplayZone.xml" />
+  </files>
+</metadata>
