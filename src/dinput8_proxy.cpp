@@ -472,7 +472,9 @@ void CaptureTransitionHostSnapshot(const BYTE* image, SIZE_T imageSize,
         Log(L"BOOT13_HOST_FIELD_FIRST_QWORD: state=%s offset=0x%X object=%p value=%016llX",
             label, offset, object, static_cast<unsigned long long>(first));
         const BYTE* candidateVtable = reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(first));
-        if (!PlausiblePointer(image, imageSize, first)) continue;
+        const bool plausibleVtable = first >= 0x10000000000ull &&
+            first < 0x0000800000000000ull && (first & 7ull) == 0;
+        if (!plausibleVtable) continue;
 
         std::uint64_t entries[16]{};
         if (!ReadMemory(candidateVtable, entries, sizeof(entries))) {
