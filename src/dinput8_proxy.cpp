@@ -722,28 +722,28 @@ void CaptureComponentHostSnapshot(const BYTE* image, SIZE_T imageSize,
 
 std::wstring RunCapture() {
     HMODULE module = GetModuleHandleW(nullptr);
-    if (!module) { Log(L"BOOT12_ABORT: main module unavailable"); return L""; }
+    if (!module) { Log(L"BOOT13_ABORT: main module unavailable"); return L""; }
     const BYTE* image = reinterpret_cast<const BYTE*>(module);
     IMAGE_DOS_HEADER dos{};
     if (!ReadMemory(image, &dos, sizeof(dos)) || dos.e_magic != IMAGE_DOS_SIGNATURE) {
-        Log(L"BOOT12_ABORT: invalid DOS header"); return L"";
+        Log(L"BOOT13_ABORT: invalid DOS header"); return L"";
     }
     IMAGE_NT_HEADERS64 nt{};
     if (!ReadMemory(image + dos.e_lfanew, &nt, sizeof(nt)) ||
         nt.Signature != IMAGE_NT_SIGNATURE || nt.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
         nt.FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64) {
-        Log(L"BOOT12_ABORT: invalid PE64/AMD64 image"); return L"";
+        Log(L"BOOT13_ABORT: invalid PE64/AMD64 image"); return L"";
     }
-    Log(L"BOOT12_IMAGE: base=%p size=0x%08X timestamp=0x%08X machine=0x%04X",
+    Log(L"BOOT13_IMAGE: base=%p size=0x%08X timestamp=0x%08X machine=0x%04X",
         module, nt.OptionalHeader.SizeOfImage, nt.FileHeader.TimeDateStamp, nt.FileHeader.Machine);
     if (nt.OptionalHeader.SizeOfImage != kImageSize || nt.FileHeader.TimeDateStamp != kImageTimestamp) {
-        Log(L"BOOT12_ABORT: executable fingerprint mismatch expected_size=0x%08X expected_timestamp=0x%08X",
+        Log(L"BOOT13_ABORT: executable fingerprint mismatch expected_size=0x%08X expected_timestamp=0x%08X",
             kImageSize, kImageTimestamp);
         return L"";
     }
     std::wstring dir = NewCaptureDirectory();
     if (dir.empty()) return L"";
-    Log(L"BOOT12_CAPTURE_DIRECTORY: %s", dir.c_str());
+    Log(L"BOOT13_CAPTURE_DIRECTORY: %s", dir.c_str());
     CaptureNativeCode(image, nt.OptionalHeader.SizeOfImage, nt, dir);
     CaptureTransitionHostSnapshot(image, nt.OptionalHeader.SizeOfImage,
                                   L"01_FREEDRIVE_VEHICLE", dir);
@@ -765,12 +765,12 @@ DWORD WINAPI Worker(LPVOID) {
     if (dir.empty()) return 0;
 
     if (!WaitForHotkey(VK_F11, L"02_HQ_PEDESTRIAN")) {
-        Log(L"BOOT12_SEQUENCE_INCOMPLETE: HQ snapshot was not triggered; directory=%s", dir.c_str());
+        Log(L"BOOT13_SEQUENCE_INCOMPLETE: HQ snapshot was not triggered; directory=%s", dir.c_str());
         return 0;
     }
     HMODULE module = GetModuleHandleW(nullptr);
     if (!module) {
-        Log(L"BOOT12_HQ_ABORT: main module unavailable");
+        Log(L"BOOT13_HQ_ABORT: main module unavailable");
         return 0;
     }
     CaptureTransitionHostSnapshot(reinterpret_cast<const BYTE*>(module),
