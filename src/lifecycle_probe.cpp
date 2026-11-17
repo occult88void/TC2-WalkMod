@@ -135,6 +135,51 @@ bool CheckPrologue(const BYTE* address, const BYTE* expected, size_t size) {
     BYTE actual[16]{};
     return ReadSafe(address, actual, size) && memcmp(actual, expected, size) == 0;
 }
+
+void LogPrologue(const wchar_t* name, const BYTE* address, const BYTE* expected, size_t size) {
+    BYTE actual[16]{};
+    if (!ReadSafe(address, actual, size)) {
+        ProbeLog(L"PROBE_CODE_READ_FAIL name=%s address=%p", name, address);
+        return;
+    }
+    wchar_t actualHex[64]{}, expectedHex[64]{};
+    size_t a = 0, e = 0;
+    for (size_t i = 0; i < size; ++i) {
+        int aw = _snwprintf_s(actualHex + a, _countof(actualHex) - a, _TRUNCATE, L"%02X", actual[i]);
+        int ew = _snwprintf_s(expectedHex + e, _countof(expectedHex) - e, _TRUNCATE, L"%02X", expected[i]);
+        if (aw > 0) a += static_cast<size_t>(aw);
+        if (ew > 0) e += static_cast<size_t>(ew);
+    }
+    ProbeLog(L"PROBE_CODE_BYTES name=%s address=%p actual=%s expected=%s",
+             name, address, actualHex, expectedHex);
+}
+
+bool WaitForCodeSignatures(BYTE* base, const BYTE* destroySig, size_t destroySize,
+                           const BYTE* spawnSig, size_t spawnSize,
+                           const BYTE* cleanupSig, size_t cleanupSize) {
+    const ULONGLONG deadline = GetTickCount64() + 180000ull;
+    unsigned attempt = 0;
+    while (GetTickCount64() < deadline) {
+        const bool destroyOk = CheckPrologue(base + kDestroyRva, destroySig, destroySize);
+        const bool spawnOk = CheckPrologue(base + kSpawnRva, spawnSig, spawnSize);
+        const bool cleanupOk = CheckPrologue(base + kCleanupRva, cleanupSig, cleanupSize);
+        if (destroyOk && spawnOk && cleanupOk) {
+            ProbeLog(L"PROBE_CODE_SIGNATURES_READY attempts=%u elapsed_ms<=180000", attempt + 1);
+            return true;
+        }
+        if (attempt == 0 || (attempt % 20) == 0) {
+            ProbeLog(L"PROBE_CODE_SIGNATURE_WAIT attempt=%u destroy=%u spawn=%u cleanup=%u",
+                     attempt + 1, destroyOk ? 1 : 0, spawnOk ? 1 : 0, cleanupOk ? 1 : 0);
+        }
+        ++attempt;
+        Sleep(250);
+    }
+    ProbeLog(L"PROBE_ABORT code signatures did not become ready within 180 seconds");
+    LogPrologue(L"Destroy", base + kDestroyRva, destroySig, destroySize);
+    LogPrologue(L"Spawn", base + kSpawnRva, spawnSig, spawnSize);
+    LogPrologue(L"Cleanup", base + kCleanupRva, cleanupSig, cleanupSize);
+    return false;
+}
 } // namespace
 
 void InstallLifecycleProbe() {
@@ -163,12 +208,9 @@ void InstallLifecycleProbe() {
     const BYTE destroySig[] = {0x40,0x57,0x48,0x83,0xEC,0x50};
     const BYTE spawnSig[] = {0x40,0x55,0x57,0x41,0x56,0x48,0x8D,0xAC};
     const BYTE cleanupSig[] = {0x48,0x89,0x5C,0x24,0x10,0x48,0x89,0x74,0x24,0x18};
-    if (!CheckPrologue(base + kDestroyRva, destroySig, sizeof(destroySig)) ||
-        !CheckPrologue(base + kSpawnRva, spawnSig, sizeof(spawnSig)) ||
-        !CheckPrologue(base + kCleanupRva, cleanupSig, sizeof(cleanupSig))) {
-        ProbeLog(L"PROBE_ABORT code signature mismatch; no hooks installed");
-        return;
-    }
+    if (!WaitForCodeSignatures(base, destroySig, sizeof(destroySig),
+                               spawnSig, sizeof(spawnSig),
+                               cleanupSig, sizeof(cleanupSig))) return;
     MH_STATUS status = MH_Initialize();
     if (status != MH_OK && status != MH_ERROR_ALREADY_INITIALIZED) {
         ProbeLog(L"PROBE_ABORT MinHook initialize status=%d", status);
