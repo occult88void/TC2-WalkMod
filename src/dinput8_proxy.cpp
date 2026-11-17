@@ -589,50 +589,6 @@ bool CreateBootstrap12CaptureSession(std::wstring& dir,IMAGE_NT_HEADERS64& ntOut
     return true;
 }
 
-std::wstring RunCapture() {
-    HMODULE module = GetModuleHandleW(nullptr);
-    if (!module) { Log(L"TARGET_CAPTURE_ABORT: main module unavailable"); return L""; }
-    const BYTE* image = reinterpret_cast<const BYTE*>(module);
-    IMAGE_DOS_HEADER dos{};
-    if (!ReadMemory(image, &dos, sizeof(dos)) || dos.e_magic != IMAGE_DOS_SIGNATURE) {
-        Log(L"TARGET_CAPTURE_ABORT: invalid DOS header"); return L"";
-    }
-    IMAGE_NT_HEADERS64 nt{};
-    if (!ReadMemory(image + dos.e_lfanew, &nt, sizeof(nt)) ||
-        nt.Signature != IMAGE_NT_SIGNATURE || nt.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
-        nt.FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64) {
-        Log(L"TARGET_CAPTURE_ABORT: invalid PE64/AMD64 image"); return L"";
-    }
-    Log(L"TARGET_CAPTURE_IMAGE: base=%p size=0x%08X timestamp=0x%08X machine=0x%04X",
-        module, nt.OptionalHeader.SizeOfImage, nt.FileHeader.TimeDateStamp, nt.FileHeader.Machine);
-    if (nt.OptionalHeader.SizeOfImage != kImageSize || nt.FileHeader.TimeDateStamp != kImageTimestamp) {
-        Log(L"TARGET_CAPTURE_ABORT: executable fingerprint mismatch expected_size=0x%08X expected_timestamp=0x%08X",
-            kImageSize, kImageTimestamp);
-        return L"";
-    }
-
-    std::wstring dir = NewCaptureDirectory();
-    if (dir.empty()) return L"";
-    Log(L"TARGET_CAPTURE_DIRECTORY: %s", dir.c_str());
-    Log(L"=== TARGETED TYPE DESCRIPTOR CAPTURE BEGIN (read-only) ===");
-    const Target targets[] = {
-        {L"avatar_tc2", 0x0344F430u},
-        {L"human_player", 0x0342CCC8u},
-        {L"ghost_player", 0x0342CDE0u},
-        {L"avatar_parent_descriptor", 0x0386C3B0u},
-        {L"player_shared_parent_descriptor", 0x038AE500u},
-        {L"mission_spawn_registry", 0x038B7430u},
-    };
-    std::vector<ObjectRef> objects;
-    for (const auto& target : targets) CaptureDescriptor(image, nt.OptionalHeader.SizeOfImage, target, dir, objects);
-    CaptureObjects(objects, dir);
-    Log(L"=== TARGETED TYPE DESCRIPTOR CAPTURE END ===");
-    CaptureNativeCode(image, nt.OptionalHeader.SizeOfImage, nt, dir);
-    CaptureComponentHostSnapshot(image, nt.OptionalHeader.SizeOfImage,
-                                 L"01_FREEDRIVE_VEHICLE", dir);
-    Log(L"TARGET_CAPTURE_COMPLETE: directory=%s", dir.c_str());
-    return dir;
-}
 
 DWORD WINAPI Worker(LPVOID) {
     wchar_t exe[MAX_PATH]{}; GetModuleFileNameW(nullptr,exe,MAX_PATH);
