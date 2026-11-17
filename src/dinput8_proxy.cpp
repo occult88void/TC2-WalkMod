@@ -446,6 +446,14 @@ void CaptureSlotRtti(const BYTE* image,SIZE_T imageSize,const IMAGE_NT_HEADERS64
         Log(L"BOOT12_OBJECT_ABORT: label=%s index=0x%X object=%p reason=vtable_read_failed error=%lu",label,index,object,GetLastError()); return;
     }
     Log(L"BOOT12_SLOT_OBJECT: label=%s index=0x%X object=%p vtable=%016llX",label,index,object,static_cast<unsigned long long>(vtable));
+    std::uint64_t field10=0, field18=0;
+    const bool field10Ok=ReadMemory(object+0x10,&field10,sizeof(field10));
+    const bool field18Ok=ReadMemory(object+0x18,&field18,sizeof(field18));
+    // Both offsets are logged as raw candidates. Neither is treated as an owner pointer
+    // until the captures establish the object layout.
+    Log(L"BOOT12_OBJECT_FIELDS: label=%s index=0x%X plus_10=%016llX readable_10=%u plus_18=%016llX readable_18=%u",
+        label,index,static_cast<unsigned long long>(field10),field10Ok?1:0,
+        static_cast<unsigned long long>(field18),field18Ok?1:0);
     wchar_t stem[96]{}; swprintf_s(stem,L"%s_index_%02X",label,index);
     CaptureWindow(object,0x100,dir+L"\\"+stem+L"_object.bin",L"bootstrap12_component_object");
 
