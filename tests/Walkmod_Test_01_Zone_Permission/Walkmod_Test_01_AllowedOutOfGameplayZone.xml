@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<root file="entity/generated/archetypes.entities.bin">
+  <edit id="0x21E4830700000000">
+    <field name="AllowedOutOfGameplayZone" type="BinHex">01</field>
+  </edit>
+</root>
