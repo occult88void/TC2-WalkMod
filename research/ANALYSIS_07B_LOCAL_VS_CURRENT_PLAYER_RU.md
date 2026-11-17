@@ -5,7 +5,7 @@
 
 ## Проверка
 
-В `TC2_ENTITY_INDEX.sqlite` проверены все data-slot bindings для `CMissionAtomIsSameEntity`. Найдено 93 узла этого типа и 186 входных связей. В 51 узле (с учётом повторно используемых графов) одна сторона сравнения приходит из `CMissionAtomGetLocalPlayer`, другая из `CMissionAtomGetCurrentPlayer`.
+В `TC2_ENTITY_INDEX.sqlite` проверены все data-slot bindings для `CMissionAtomIsSameEntity`. Найдено 93 узла этого типа и 186 входных связей. В 70 узлах (с учётом повторно используемых графов) одна сторона сравнения приходит из `CMissionAtomGetLocalPlayer`, другая из `CMissionAtomGetCurrentPlayer`.
 
 Примеры подтверждённых связей:
 
