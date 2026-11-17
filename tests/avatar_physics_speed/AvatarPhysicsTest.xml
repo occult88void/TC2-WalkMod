@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<root file="entity/generated/archetypes.entities.bin">
+  <!-- Experimental test: double the base Avatar walking speed from 2.5 to 5.0. -->
+  <edit depth="85092:0:1">
+    <field name="WalkSpeed" type="BinHex">0000A040</field>
+  </edit>
+</root>
