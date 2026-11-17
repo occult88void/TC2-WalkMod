@@ -414,95 +414,179 @@ void CaptureManagerCandidate(const BYTE* image, SIZE_T imageSize, const std::wst
 }
 
 
-void CaptureComponentHostSnapshot(const BYTE* image, SIZE_T imageSize,
-                                  const wchar_t* label, const std::wstring& dir) {
-    constexpr DWORD kGlobalPointerRva = 0x0343C630u;
-    Log(L"=== COMPONENT HOST SNAPSHOT BEGIN label=%s (read-only) ===", label);
-    if (kGlobalPointerRva > imageSize || sizeof(std::uint64_t) > imageSize - kGlobalPointerRva) {
-        Log(L"COMPONENT_HOST_ABORT: label=%s reason=global_slot_outside_image", label);
-        return;
+
+struct MsvcCompleteObjectLocator {
+    std::uint32_t signature, offset, cdOffset, typeDescriptorRva, classDescriptorRva, selfRva;
+};
+
+bool ImageRangeContains(const BYTE* image, SIZE_T imageSize, std::uint64_t address, SIZE_T size) {
+    const std::uint64_t base=reinterpret_cast<std::uint64_t>(image);
+    if(address<base||size>imageSize) return false;
+    const std::uint64_t offset=address-base;
+    return offset<=imageSize-size;
+}
+
+bool ReadBoundedTypeName(const BYTE* address, std::wstring& name) {
+    name.clear();
+    for(SIZE_T i=0;i<256;++i) {
+        char ch=0;
+        if(!ReadMemory(address+0x10+i,&ch,1)) return false;
+        if(ch=='\0') return !name.empty();
+        name.push_back(static_cast<unsigned char>(ch));
     }
+    return false;
+}
 
-    std::uint64_t host = 0;
-    if (!ReadMemory(image + kGlobalPointerRva, &host, sizeof(host)) ||
-        !PlausiblePointer(image, imageSize, host)) {
-        Log(L"COMPONENT_HOST_ABORT: label=%s reason=invalid_global_pointer value=%016llX",
-            label, static_cast<unsigned long long>(host));
-        return;
+void CaptureSlotRtti(const BYTE* image,SIZE_T imageSize,const IMAGE_NT_HEADERS64& nt,
+                     const std::wstring& dir,const wchar_t* label,std::uint32_t index,
+                     std::uint64_t objectAddress,std::vector<std::uint64_t>& capturedFunctions) {
+    const BYTE* object=reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(objectAddress));
+    std::uint64_t vtable=0;
+    if(!ReadMemory(object,&vtable,sizeof(vtable))) {
+        Log(L"BOOT12_OBJECT_ABORT: label=%s index=0x%X object=%p reason=vtable_read_failed error=%lu",label,index,object,GetLastError()); return;
     }
+    Log(L"BOOT12_SLOT_OBJECT: label=%s index=0x%X object=%p vtable=%016llX",label,index,object,static_cast<unsigned long long>(vtable));
+    wchar_t stem[96]{}; swprintf_s(stem,L"%s_index_%02X",label,index);
+    CaptureWindow(object,0x100,dir+L"\\"+stem+L"_object.bin",L"bootstrap12_component_object");
 
-    const BYTE* root = reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(host));
-    std::uint64_t table = 0, tableMeta = 0, selector = 0, selectorMeta = 0, cameraCandidate = 0;
-    const bool tableOk = ReadMemory(root + 0x1DD8, &table, sizeof(table));
-    const bool tableMetaOk = ReadMemory(root + 0x1DE0, &tableMeta, sizeof(tableMeta));
-    const bool selectorOk = ReadMemory(root + 0x1DE8, &selector, sizeof(selector));
-    const bool selectorMetaOk = ReadMemory(root + 0x1DF0, &selectorMeta, sizeof(selectorMeta));
-    ReadMemory(root + 0x1E68, &cameraCandidate, sizeof(cameraCandidate));
+    constexpr SIZE_T n=16, bytes=n*sizeof(std::uint64_t);
+    if(!ImageRangeContains(image,imageSize,vtable,bytes)) {
+        Log(L"BOOT12_VTABLE_ABORT: label=%s index=0x%X reason=vtable_outside_main_image address=%016llX",label,index,static_cast<unsigned long long>(vtable)); return;
+    }
+    std::vector<std::uint64_t> methods(n);
+    if(!ReadMemory(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(vtable)),methods.data(),bytes)) {
+        Log(L"BOOT12_VTABLE_ABORT: label=%s index=0x%X reason=vtable_read_failed error=%lu",label,index,GetLastError()); return;
+    }
+    std::wstring vf=std::wstring(stem)+L"_vtable_16.bin";
+    if(WriteFileBytes(dir+L"\\"+vf,reinterpret_cast<const BYTE*>(methods.data()),bytes))
+        Log(L"BOOT12_VTABLE_OK: label=%s index=0x%X address=%016llX entries=16 file=%s",label,index,static_cast<unsigned long long>(vtable),vf.c_str());
 
-    std::uint32_t count = static_cast<std::uint32_t>(tableMeta & 0xFFFFFFFFu);
-    if (count == 0 || count > 128) count = 128;
-
-    Log(L"COMPONENT_HOST_ROOT: label=%s host=%p table=%p tableMeta=%016llX selector=%p selectorMeta=%016llX field_1E68=%016llX count=%u",
-        label, root, reinterpret_cast<void*>(static_cast<std::uintptr_t>(table)),
-        static_cast<unsigned long long>(tableMeta),
-        reinterpret_cast<void*>(static_cast<std::uintptr_t>(selector)),
-        static_cast<unsigned long long>(selectorMeta),
-        static_cast<unsigned long long>(cameraCandidate), count);
-
-    std::wstring prefix = std::wstring(L"host_") + label;
-    CaptureWindow(root, 0x2000, dir + L"\\" + prefix + L"_root.bin", L"component_host_root");
-
-    if (tableOk && PlausiblePointer(image, imageSize, table)) {
-        CaptureWindow(reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(table)),
-                      static_cast<SIZE_T>(count) * sizeof(std::uint64_t),
-                      dir + L"\\" + prefix + L"_component_table.bin",
-                      L"component_host_pointer_table");
+    const std::uint64_t imageBase=reinterpret_cast<std::uint64_t>(image);
+    if(vtable<imageBase+8) {
+        Log(L"BOOT12_RTTI_SKIP: label=%s index=0x%X reason=no_preceding_locator_slot",label,index);
     } else {
-        Log(L"COMPONENT_HOST_TABLE_SKIP: label=%s readable=%u pointer=%016llX",
-            label, tableOk ? 1 : 0, static_cast<unsigned long long>(table));
+        std::uint64_t locator=0;
+        const BYTE* slot=reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(vtable-8));
+        if(ReadMemory(slot,&locator,8)&&ImageRangeContains(image,imageSize,locator,sizeof(MsvcCompleteObjectLocator))) {
+            MsvcCompleteObjectLocator col{};
+            const BYTE* cp=reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(locator));
+            if(ReadMemory(cp,&col,sizeof(col))) {
+                const std::uint64_t self=locator-imageBase;
+                const bool valid=col.signature==1&&col.selfRva==self&&
+                    ImageRangeContains(image,imageSize,imageBase+col.typeDescriptorRva,0x11)&&
+                    ImageRangeContains(image,imageSize,imageBase+col.classDescriptorRva,1);
+                Log(L"BOOT12_RTTI_LOCATOR: label=%s index=0x%X address=%p signature=%u offset=0x%X cdOffset=0x%X typeRva=0x%08X hierarchyRva=0x%08X selfRva=0x%08X self_check=%u valid=%u",
+                    label,index,cp,col.signature,col.offset,col.cdOffset,col.typeDescriptorRva,col.classDescriptorRva,col.selfRva,col.selfRva==self?1:0,valid?1:0);
+                CaptureWindow(cp,sizeof(col),dir+L"\\"+stem+L"_rtti_col.bin",L"bootstrap12_rtti_col");
+                if(valid) {
+                    const BYTE* td=image+col.typeDescriptorRva;
+                    const BYTE* chd=image+col.classDescriptorRva;
+                    CaptureWindow(td,0x100,dir+L"\\"+stem+L"_rtti_type_descriptor.bin",L"bootstrap12_rtti_type_descriptor");
+                    CaptureWindow(chd,0x40,dir+L"\\"+stem+L"_rtti_class_hierarchy.bin",L"bootstrap12_rtti_class_hierarchy");
+                    std::wstring typeName;
+                    if(ReadBoundedTypeName(td,typeName)) Log(L"BOOT12_RTTI_TYPE_NAME: label=%s index=0x%X name=%s",label,index,typeName.c_str());
+                    else Log(L"BOOT12_RTTI_TYPE_NAME_UNAVAILABLE: label=%s index=0x%X",label,index);
+                }
+            } else Log(L"BOOT12_RTTI_SKIP: label=%s index=0x%X reason=locator_read_failed",label,index);
+        } else Log(L"BOOT12_RTTI_SKIP: label=%s index=0x%X reason=locator_pointer_not_in_main_image value=%016llX",label,index,static_cast<unsigned long long>(locator));
     }
 
-    if (selectorOk && PlausiblePointer(image, imageSize, selector)) {
-        CaptureWindow(reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(selector)),
-                      0x400, dir + L"\\" + prefix + L"_selector_table.bin",
-                      L"component_host_selector_table");
-    } else {
-        Log(L"COMPONENT_HOST_SELECTOR_SKIP: label=%s readable=%u pointer=%016llX",
-            label, selectorOk ? 1 : 0, static_cast<unsigned long long>(selector));
-    }
-
-    if (PlausiblePointer(image, imageSize, cameraCandidate)) {
-        CaptureWindow(reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(cameraCandidate)),
-                      0x200, dir + L"\\" + prefix + L"_field_1E68_target.bin",
-                      L"component_host_field_1E68_target");
-    }
-
-    if (tableOk && PlausiblePointer(image, imageSize, table)) {
-        const BYTE* entries = reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(table));
-        for (std::uint32_t i = 0; i < count; ++i) {
-            std::uint64_t component = 0;
-            if (!ReadMemory(entries + static_cast<SIZE_T>(i) * sizeof(component),
-                            &component, sizeof(component))) break;
-            if (!PlausiblePointer(image, imageSize, component)) continue;
-
-            std::uint64_t vtable = 0, owner = 0;
-            const BYTE* object = reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(component));
-            ReadMemory(object, &vtable, sizeof(vtable));
-            ReadMemory(object + 0x18, &owner, sizeof(owner));
-
-            Log(L"COMPONENT_HOST_ENTRY: label=%s index=%u pointer=%016llX vtable=%016llX owner_plus_18=%016llX%s",
-                label, i, static_cast<unsigned long long>(component),
-                static_cast<unsigned long long>(vtable),
-                static_cast<unsigned long long>(owner),
-                i == 0x1C ? L" SLOT_1C_CANDIDATE_UNVERIFIED" : L"");
-
-            wchar_t file[128]{};
-            swprintf_s(file, L"%s_component_%03u.bin", label, i);
-            CaptureWindow(object, 0x100, dir + L"\\" + file, L"component_host_entry");
+    unsigned valid=0;
+    for(SIZE_T i=0;i<methods.size();++i) {
+        const std::uint64_t address=methods[i];
+        if(!ImageRangeContains(image,imageSize,address,1)) {
+            Log(L"BOOT12_VFUNC_SKIP: label=%s index=0x%X vslot=%llu target=%016llX reason=outside_main_image",label,index,static_cast<unsigned long long>(i),static_cast<unsigned long long>(address)); continue;
         }
+        const DWORD rva=static_cast<DWORD>(address-imageBase);
+        if(!IsExecutableRange(image,nt,rva,1)) {
+            Log(L"BOOT12_VFUNC_SKIP: label=%s index=0x%X vslot=%llu target=%016llX reason=not_executable",label,index,static_cast<unsigned long long>(i),static_cast<unsigned long long>(address)); continue;
+        }
+        ++valid;
+        Log(L"BOOT12_VFUNC: label=%s index=0x%X vslot=%llu rva=0x%08X address=%016llX",label,index,static_cast<unsigned long long>(i),rva,static_cast<unsigned long long>(address));
+        if(std::find(capturedFunctions.begin(),capturedFunctions.end(),address)!=capturedFunctions.end()) continue;
+        capturedFunctions.push_back(address);
+        wchar_t fn[128]{}; swprintf_s(fn,L"%s_index_%02X_vfunc_%02llu_rva_%08X.bin",label,index,static_cast<unsigned long long>(i),rva);
+        CaptureWindow(reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(address)),0x80,dir+L"\\"+fn,L"bootstrap12_virtual_function");
     }
+    Log(L"BOOT12_VFUNC_SUMMARY: label=%s index=0x%X inspected=16 executable_in_image=%u",label,index,valid);
+}
 
-    Log(L"=== COMPONENT HOST SNAPSHOT END label=%s ===", label);
+void CaptureComponentHostSnapshot(const BYTE* image,SIZE_T imageSize,const IMAGE_NT_HEADERS64& nt,
+                                  const wchar_t* label,const std::wstring& dir) {
+    constexpr DWORD globalRva=0x0343C630u;
+    constexpr std::uint32_t indices[]={0x1A,0x1C};
+    Log(L"=== BOOTSTRAP12 COMPONENT SLOT SNAPSHOT BEGIN label=%s (read-only) ===",label);
+    if(globalRva>imageSize||8>imageSize-globalRva) { Log(L"BOOT12_HOST_ABORT: label=%s reason=global_slot_outside_image",label); return; }
+    std::uint64_t host=0;
+    if(!ReadMemory(image+globalRva,&host,8)||!PlausiblePointer(image,imageSize,host)) {
+        Log(L"BOOT12_HOST_ABORT: label=%s reason=invalid_global_pointer value=%016llX",label,static_cast<unsigned long long>(host)); return;
+    }
+    const BYTE* root=reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(host));
+    std::uint64_t table=0,meta=0;
+    if(!ReadMemory(root+0x1DD8,&table,8)||!ReadMemory(root+0x1DE0,&meta,8)) {
+        Log(L"BOOT12_HOST_ABORT: label=%s reason=table_fields_unreadable",label); return;
+    }
+    const std::uint32_t count=static_cast<std::uint32_t>(meta&0xFFFFFFFFu);
+    Log(L"BOOT12_HOST: label=%s host=%p table=%016llX tableMeta=%016llX count=%u",label,root,static_cast<unsigned long long>(table),static_cast<unsigned long long>(meta),count);
+    if(count==0||count>128||!PlausiblePointer(image,imageSize,table)) {
+        Log(L"BOOT12_TABLE_ABORT: label=%s reason=invalid_count_or_pointer count=%u table=%016llX",label,count,static_cast<unsigned long long>(table)); return;
+    }
+    const SIZE_T tableBytes=static_cast<SIZE_T>(count)*8;
+    const BYTE* tableAddress=reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(table));
+    MEMORY_BASIC_INFORMATION mbi{};
+    if(VirtualQuery(tableAddress,&mbi,sizeof(mbi))!=sizeof(mbi)||mbi.State!=MEM_COMMIT||!Readable(mbi.Protect)) {
+        Log(L"BOOT12_TABLE_ABORT: label=%s reason=table_not_readable",label); return;
+    }
+    const BYTE* regionEnd=static_cast<const BYTE*>(mbi.BaseAddress)+mbi.RegionSize;
+    if(regionEnd<tableAddress||static_cast<SIZE_T>(regionEnd-tableAddress)<tableBytes) {
+        Log(L"BOOT12_TABLE_ABORT: label=%s reason=table_exceeds_memory_region bytes=0x%llX",label,static_cast<unsigned long long>(tableBytes)); return;
+    }
+    // First read is authoritative. The second read only detects mutation; all lookups use snapshot.
+    std::vector<std::uint64_t> snapshot(count),verify(count);
+    if(!ReadMemory(tableAddress,snapshot.data(),tableBytes)) { Log(L"BOOT12_TABLE_ABORT: label=%s reason=snapshot_read_failed error=%lu",label,GetLastError()); return; }
+    const bool verifyRead=ReadMemory(tableAddress,verify.data(),tableBytes);
+    const bool stable=verifyRead&&memcmp(snapshot.data(),verify.data(),tableBytes)==0;
+    Log(L"BOOT12_TABLE_STABILITY: label=%s count=%u second_read=%u identical=%u policy=use_first_snapshot",label,count,verifyRead?1:0,stable?1:0);
+    wchar_t tableFile[96]{}; swprintf_s(tableFile,L"host_%s_component_table_snapshot.bin",label);
+    if(WriteFileBytes(dir+L"\\"+tableFile,reinterpret_cast<const BYTE*>(snapshot.data()),tableBytes))
+        Log(L"BOOT12_TABLE_SNAPSHOT_OK: label=%s entries=%u bytes=0x%llX file=%s",label,count,static_cast<unsigned long long>(tableBytes),tableFile);
+    else Log(L"BOOT12_TABLE_WRITE_ERROR: label=%s",label);
+
+    std::vector<std::uint64_t> capturedFunctions;
+    for(std::uint32_t index:indices) {
+        if(index>=snapshot.size()) { Log(L"BOOT12_SLOT_MISSING: label=%s index=0x%X count=%u",label,index,count); continue; }
+        const std::uint64_t component=snapshot[index];
+        if(!PlausiblePointer(image,imageSize,component)) {
+            Log(L"BOOT12_SLOT_INVALID: label=%s index=0x%X pointer=%016llX",label,index,static_cast<unsigned long long>(component)); continue;
+        }
+        CaptureSlotRtti(image,imageSize,nt,dir,label,index,component,capturedFunctions);
+    }
+    Log(L"=== BOOTSTRAP12 COMPONENT SLOT SNAPSHOT END label=%s ===",label);
+}
+
+bool CreateBootstrap12CaptureSession(std::wstring& dir,IMAGE_NT_HEADERS64& ntOut,
+                                     const BYTE*& imageOut,SIZE_T& imageSizeOut) {
+    HMODULE module=GetModuleHandleW(nullptr);
+    if(!module) { Log(L"BOOT12_ABORT: main_module_unavailable"); return false; }
+    const BYTE* image=reinterpret_cast<const BYTE*>(module);
+    IMAGE_DOS_HEADER dos{};
+    if(!ReadMemory(image,&dos,sizeof(dos))||dos.e_magic!=IMAGE_DOS_SIGNATURE||dos.e_lfanew<=0||static_cast<SIZE_T>(dos.e_lfanew)>0x100000) {
+        Log(L"BOOT12_ABORT: invalid_dos_header"); return false;
+    }
+    IMAGE_NT_HEADERS64 nt{};
+    if(!ReadMemory(image+dos.e_lfanew,&nt,sizeof(nt))||nt.Signature!=IMAGE_NT_SIGNATURE||
+       nt.OptionalHeader.Magic!=IMAGE_NT_OPTIONAL_HDR64_MAGIC||nt.FileHeader.Machine!=IMAGE_FILE_MACHINE_AMD64) {
+        Log(L"BOOT12_ABORT: invalid_pe64_amd64_image"); return false;
+    }
+    Log(L"BOOT12_IMAGE: base=%p size=0x%08X timestamp=0x%08X machine=0x%04X",module,nt.OptionalHeader.SizeOfImage,nt.FileHeader.TimeDateStamp,nt.FileHeader.Machine);
+    if(nt.OptionalHeader.SizeOfImage!=kImageSize||nt.FileHeader.TimeDateStamp!=kImageTimestamp) {
+        Log(L"BOOT12_ABORT: executable_fingerprint_mismatch expected_size=0x%08X expected_timestamp=0x%08X",kImageSize,kImageTimestamp); return false;
+    }
+    dir=NewCaptureDirectory();
+    if(dir.empty()) return false;
+    ntOut=nt; imageOut=image; imageSizeOut=nt.OptionalHeader.SizeOfImage;
+    Log(L"BOOT12_CAPTURE_DIRECTORY: %s",dir.c_str());
+    return true;
 }
 
 std::wstring RunCapture() {
@@ -551,28 +635,22 @@ std::wstring RunCapture() {
 }
 
 DWORD WINAPI Worker(LPVOID) {
-    wchar_t exe[MAX_PATH]{};
-    GetModuleFileNameW(nullptr, exe, MAX_PATH);
-    Log(L"=== TC2 Walkmod diagnostic bootstrap 11 (read-only component-host snapshots) ===");
-    Log(L"BOOTSTRAP_VERSION: 11");
-    Log(L"PROBE_MODE: read-only; no MinHook; no code patches; no memory writes to game");
-    Log(L"Game executable: %s", exe);
-
-    if (!WaitForHotkey(VK_F10, L"01_FREEDRIVE_VEHICLE")) return 0;
-    std::wstring dir = RunCapture();
-    if (dir.empty()) return 0;
-
-    if (WaitForHotkey(VK_F11, L"02_HQ_PEDESTRIAN")) {
-        HMODULE module = GetModuleHandleW(nullptr);
-        if (module) CaptureComponentHostSnapshot(reinterpret_cast<const BYTE*>(module),
-                                                   kImageSize, L"02_HQ_PEDESTRIAN", dir);
-    }
-    if (WaitForHotkey(VK_F12, L"03_OPEN_WORLD_PEDESTRIAN")) {
-        HMODULE module = GetModuleHandleW(nullptr);
-        if (module) CaptureComponentHostSnapshot(reinterpret_cast<const BYTE*>(module),
-                                                   kImageSize, L"03_OPEN_WORLD_PEDESTRIAN", dir);
-    }
-    Log(L"BOOTSTRAP11_SEQUENCE_COMPLETE: directory=%s", dir.c_str());
+    wchar_t exe[MAX_PATH]{}; GetModuleFileNameW(nullptr,exe,MAX_PATH);
+    Log(L"=== TC2 Walkmod diagnostic bootstrap 12 (narrow slot/RTTI capture) ===");
+    Log(L"BOOTSTRAP_VERSION: 12");
+    Log(L"PROBE_MODE: read-only; no hooks; no code patches; no writes to game memory");
+    Log(L"TABLE_POLICY: first table read is authoritative; second read is stability check only");
+    Log(L"TARGETS: component table indices 0x1A and 0x1C only");
+    Log(L"Game executable: %s",exe);
+    std::wstring dir; IMAGE_NT_HEADERS64 nt{}; const BYTE* image=nullptr; SIZE_T imageSize=0;
+    if(!CreateBootstrap12CaptureSession(dir,nt,image,imageSize)) return 0;
+    if(WaitForHotkey(VK_F10,L"01_FREEDRIVE_VEHICLE"))
+        CaptureComponentHostSnapshot(image,imageSize,nt,L"01_FREEDRIVE_VEHICLE",dir);
+    if(WaitForHotkey(VK_F11,L"02_HQ_PEDESTRIAN"))
+        CaptureComponentHostSnapshot(image,imageSize,nt,L"02_HQ_PEDESTRIAN",dir);
+    if(WaitForHotkey(VK_F12,L"03_OPEN_WORLD_PEDESTRIAN"))
+        CaptureComponentHostSnapshot(image,imageSize,nt,L"03_OPEN_WORLD_PEDESTRIAN",dir);
+    Log(L"BOOTSTRAP12_SEQUENCE_COMPLETE: directory=%s",dir.c_str());
     return 0;
 }
 
