@@ -322,50 +322,51 @@ bool CaptureWindow(const BYTE* address, SIZE_T requested, const std::wstring& pa
 
 void CaptureNativeCode(const BYTE* image, SIZE_T imageSize, const IMAGE_NT_HEADERS64& nt,
                        const std::wstring& dir) {
-    Log(L"=== VER09 NATIVE LIFECYCLE CODE WINDOWS BEGIN (read-only) ===");
+    Log(L"=== BOOTSTRAP13 NATIVE TRANSITION CODE CAPTURE BEGIN (read-only) ===");
+    // Neutral capture labels only; these are not recovered native symbols.
     const CodeTarget targets[] = {
-        {L"destroy_current_vehicle_avatar_mode", 0x001FA430u, 0x180},
-        {L"spawn_replica_vehicle",               0x001FA530u, 0x180},
-        {L"avatar_vehicle_lifecycle_caller",     0x00204800u, 0x600},
-        {L"vehicle_cleanup_helper",              0x00841100u, 0x240},
-        {L"vehicle_cleanup_helper_inner",        0x00841780u, 0x300},
+        {L"candidate_transition_helper_A", 0x001FA430u, 0x120},
+        {L"candidate_transition_helper_B", 0x001FA530u, 0x420},
+        {L"candidate_transition_update",   0x00204800u, 0xC00},
+        {L"candidate_cleanup_helper",     0x00841100u, 0x240},
+        {L"candidate_cleanup_inner",      0x00841780u, 0x180},
+        {L"direct_callee_00796CC0",       0x00796CC0u, 0x200},
+        {L"direct_callee_00796C70",       0x00796C70u, 0x200},
+        {L"direct_callee_0076DED0",       0x0076DED0u, 0x200},
+        {L"direct_callee_008D9CE0",       0x008D9CE0u, 0x200},
+        {L"direct_callee_008E4D60",       0x008E4D60u, 0x200},
+        {L"direct_callee_008DA550",       0x008DA550u, 0x200},
+        {L"direct_callee_00A10980",       0x00A10980u, 0x200},
+        {L"direct_callee_00A11300",       0x00A11300u, 0x200},
+        {L"direct_callee_00A10470",       0x00A10470u, 0x200},
+        {L"direct_callee_001F9250",       0x001F9250u, 0x200},
+        {L"direct_callee_011DDA0",        0x011DDA0u,  0x200},
     };
     unsigned captured = 0, skipped = 0;
     for (const auto& target : targets) {
         if (target.rva > imageSize || target.size > imageSize - target.rva ||
             !IsExecutableRange(image, nt, target.rva, target.size)) {
             ++skipped;
-            Log(L"VER09_CODE_SKIP: name=%s rva=0x%08X size=0x%llX reason=not_executable_or_outside_image",
+            Log(L"BOOT13_CODE_SKIP: name=%s rva=0x%08X size=0x%llX reason=not_executable_or_outside_image",
                 target.name, target.rva, static_cast<unsigned long long>(target.size));
-            continue;
-        }
-        std::vector<BYTE> bytes(target.size);
-        if (!ReadMemory(image + target.rva, bytes.data(), bytes.size())) {
-            ++skipped;
-            Log(L"VER09_CODE_READ_ERROR: name=%s rva=0x%08X error=%lu",
-                target.name, target.rva, GetLastError());
             continue;
         }
         std::wstring file = std::wstring(target.name) + L"_rva_" +
             std::to_wstring(target.rva) + L".bin";
-        if (!WriteFileBytes(dir + L"\\" + file, bytes.data(), bytes.size())) {
+        const bool ok = CaptureWindow(image + target.rva, target.size,
+                                      dir + L"\\" + file, L"boot13_native_code");
+        if (!ok) {
             ++skipped;
             continue;
         }
-        std::uint64_t first = 0, second = 0;
-        memcpy(&first, bytes.data(), 8);
-        memcpy(&second, bytes.data() + 8, 8);
-        Log(L"VER09_CODE_OK: name=%s rva=0x%08X address=%p size=0x%llX qword0=%016llX qword1=%016llX file=%s",
-            target.name, target.rva, image + target.rva,
-            static_cast<unsigned long long>(bytes.size()),
-            static_cast<unsigned long long>(first), static_cast<unsigned long long>(second), file.c_str());
+        Log(L"BOOT13_CODE_OK: name=%s rva=0x%08X requested=0x%llX file=%s",
+            target.name, target.rva, static_cast<unsigned long long>(target.size), file.c_str());
         ++captured;
     }
-    Log(L"VER09_CODE_SUMMARY: targets=%llu captured=%u skipped=%u",
+    Log(L"BOOT13_CODE_SUMMARY: targets=%llu captured=%u skipped=%u",
         static_cast<unsigned long long>(_countof(targets)), captured, skipped);
-    Log(L"=== VER09 NATIVE LIFECYCLE CODE WINDOWS END ===");
+    Log(L"=== BOOTSTRAP13 NATIVE TRANSITION CODE CAPTURE END ===");
 }
-
 void CaptureManagerCandidate(const BYTE* image, SIZE_T imageSize, const std::wstring& dir) {
     constexpr DWORD kGlobalPointerRva = 0x0343C630u;
     constexpr SIZE_T kManagerWindowSize = 0x2000;
@@ -422,6 +423,89 @@ bool IsExecutableAddress(const BYTE* address) {
     const DWORD p = mbi.Protect & 0xFF;
     return p == PAGE_EXECUTE || p == PAGE_EXECUTE_READ ||
            p == PAGE_EXECUTE_READWRITE || p == PAGE_EXECUTE_WRITECOPY;
+}
+
+void CaptureTransitionHostSnapshot(const BYTE* image, SIZE_T imageSize,
+                                   const wchar_t* label, const std::wstring& dir) {
+    constexpr DWORD kGlobalPointerRva = 0x0343C630u;
+    const DWORD pointerOffsets[] = {0x650u, 0x658u, 0x6D0u, 0x6D8u};
+    const DWORD scalarOffsets[] = {0x680u, 0x700u};
+    Log(L"=== BOOTSTRAP13 TRANSITION HOST SNAPSHOT BEGIN state=%s ===", label);
+    if (kGlobalPointerRva > imageSize || sizeof(std::uint64_t) > imageSize - kGlobalPointerRva) {
+        Log(L"BOOT13_HOST_ABORT: state=%s reason=global_slot_outside_image", label);
+        return;
+    }
+    std::uint64_t host = 0;
+    if (!ReadMemory(image + kGlobalPointerRva, &host, sizeof(host)) ||
+        !PlausiblePointer(image, imageSize, host)) {
+        Log(L"BOOT13_HOST_ABORT: state=%s reason=invalid_host_pointer value=%016llX",
+            label, static_cast<unsigned long long>(host));
+        return;
+    }
+    const BYTE* root = reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(host));
+    Log(L"BOOT13_HOST: state=%s host=%p", label, root);
+    wchar_t rootFile[128]{};
+    swprintf_s(rootFile, L"%s_transition_host_root.bin", label);
+    CaptureWindow(root, 0x740, dir + L"\\" + rootFile, L"boot13_transition_host_root");
+
+    for (DWORD offset : pointerOffsets) {
+        std::uint64_t value = 0;
+        if (!ReadMemory(root + offset, &value, sizeof(value))) {
+            Log(L"BOOT13_HOST_FIELD_SKIP: state=%s offset=0x%X reason=read_failed error=%lu",
+                label, offset, GetLastError());
+            continue;
+        }
+        Log(L"BOOT13_HOST_POINTER: state=%s offset=0x%X value=%016llX",
+            label, offset, static_cast<unsigned long long>(value));
+        if (!PlausiblePointer(image, imageSize, value)) {
+            Log(L"BOOT13_HOST_POINTER_SKIP: state=%s offset=0x%X reason=not_plausible_external_pointer",
+                label, offset);
+            continue;
+        }
+        const BYTE* object = reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(value));
+        wchar_t objectFile[128]{};
+        swprintf_s(objectFile, L"%s_host_field_%04X_object.bin", label, offset);
+        if (!CaptureWindow(object, 0x200, dir + L"\\" + objectFile, L"boot13_host_field_object")) continue;
+
+        std::uint64_t first = 0;
+        if (!ReadMemory(object, &first, sizeof(first))) continue;
+        Log(L"BOOT13_HOST_FIELD_FIRST_QWORD: state=%s offset=0x%X object=%p value=%016llX",
+            label, offset, object, static_cast<unsigned long long>(first));
+        const BYTE* candidateVtable = reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(first));
+        if (!PlausiblePointer(image, imageSize, first)) continue;
+
+        std::uint64_t entries[16]{};
+        if (!ReadMemory(candidateVtable, entries, sizeof(entries))) {
+            Log(L"BOOT13_HOST_VTABLE_SKIP: state=%s offset=0x%X candidate=%p reason=unreadable",
+                label, offset, candidateVtable);
+            continue;
+        }
+        wchar_t vtableFile[128]{};
+        swprintf_s(vtableFile, L"%s_host_field_%04X_vtable16.bin", label, offset);
+        CaptureWindow(candidateVtable, sizeof(entries), dir + L"\\" + vtableFile, L"boot13_host_field_vtable");
+        unsigned executableTargets = 0;
+        for (unsigned i = 0; i < 16; ++i) {
+            const BYTE* target = reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(entries[i]));
+            if (!entries[i] || !IsExecutableAddress(target)) continue;
+            ++executableTargets;
+            const std::uint64_t base = reinterpret_cast<std::uint64_t>(image);
+            const std::uint64_t rva = entries[i] >= base && entries[i] - base < imageSize
+                ? entries[i] - base : 0;
+            Log(L"BOOT13_HOST_VFUNC: state=%s field=0x%X index=%u address=%p image_rva=0x%llX",
+                label, offset, i, target, static_cast<unsigned long long>(rva));
+        }
+        Log(L"BOOT13_HOST_VTABLE_SUMMARY: state=%s offset=0x%X candidate=%p executable_targets=%u",
+            label, offset, candidateVtable, executableTargets);
+    }
+
+    for (DWORD offset : scalarOffsets) {
+        std::uint64_t value = 0;
+        if (ReadMemory(root + offset, &value, sizeof(value))) {
+            Log(L"BOOT13_HOST_SCALAR: state=%s offset=0x%X value=%016llX",
+                label, offset, static_cast<unsigned long long>(value));
+        }
+    }
+    Log(L"=== BOOTSTRAP13 TRANSITION HOST SNAPSHOT END state=%s ===", label);
 }
 
 void CaptureSlotVtableAndRtti(const BYTE* image, SIZE_T imageSize,
@@ -634,7 +718,7 @@ void CaptureComponentHostSnapshot(const BYTE* image, SIZE_T imageSize,
     Log(L"=== BOOTSTRAP12 TWO-STATE SLOT CAPTURE END state=%s ===", label);
 }
 
-std::wstring RunCapture(std::vector<std::uint64_t>& capturedFunctions) {
+std::wstring RunCapture() {
     HMODULE module = GetModuleHandleW(nullptr);
     if (!module) { Log(L"BOOT12_ABORT: main module unavailable"); return L""; }
     const BYTE* image = reinterpret_cast<const BYTE*>(module);
@@ -658,24 +742,24 @@ std::wstring RunCapture(std::vector<std::uint64_t>& capturedFunctions) {
     std::wstring dir = NewCaptureDirectory();
     if (dir.empty()) return L"";
     Log(L"BOOT12_CAPTURE_DIRECTORY: %s", dir.c_str());
-    CaptureComponentHostSnapshot(image, nt.OptionalHeader.SizeOfImage,
-                                 L"01_FREEDRIVE_VEHICLE", dir, capturedFunctions);
+    CaptureNativeCode(image, nt.OptionalHeader.SizeOfImage, nt, dir);
+    CaptureTransitionHostSnapshot(image, nt.OptionalHeader.SizeOfImage,
+                                  L"01_FREEDRIVE_VEHICLE", dir);
     return dir;
 }
 
 DWORD WINAPI Worker(LPVOID) {
     wchar_t exe[MAX_PATH]{};
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
-    Log(L"=== TC2 Walkmod diagnostic bootstrap 12 (two-state slot/vtable/RTTI capture) ===");
-    Log(L"BOOTSTRAP_VERSION: 12");
+    Log(L"=== TC2 Walkmod diagnostic bootstrap 13 (transition lifecycle and host pointers) ===");
+    Log(L"BOOTSTRAP_VERSION: 13");
     Log(L"PROBE_MODE: read-only; no hooks; no code patches; no game-memory writes");
     Log(L"TEST_SCENARIOS: 01_FREEDRIVE_VEHICLE then 02_HQ_PEDESTRIAN only");
     Log(L"EXCLUDED: Leave action and open-world pedestrian scenario are not part of this capture");
     Log(L"Game executable: %s", exe);
 
-    std::vector<std::uint64_t> capturedFunctions;
     if (!WaitForHotkey(VK_F10, L"01_FREEDRIVE_VEHICLE")) return 0;
-    std::wstring dir = RunCapture(capturedFunctions);
+    std::wstring dir = RunCapture();
     if (dir.empty()) return 0;
 
     if (!WaitForHotkey(VK_F11, L"02_HQ_PEDESTRIAN")) {
@@ -687,10 +771,10 @@ DWORD WINAPI Worker(LPVOID) {
         Log(L"BOOT12_HQ_ABORT: main module unavailable");
         return 0;
     }
-    CaptureComponentHostSnapshot(reinterpret_cast<const BYTE*>(module),
-                                 kImageSize, L"02_HQ_PEDESTRIAN", dir, capturedFunctions);
-    Log(L"BOOTSTRAP12_SEQUENCE_COMPLETE: directory=%s unique_vfuncs=%llu",
-        dir.c_str(), static_cast<unsigned long long>(capturedFunctions.size()));
+    CaptureTransitionHostSnapshot(reinterpret_cast<const BYTE*>(module),
+                                   kImageSize, L"02_HQ_PEDESTRIAN", dir);
+    Log(L"BOOTSTRAP13_SEQUENCE_COMPLETE: directory=%s",
+        dir.c_str());
     return 0;
 }
 
