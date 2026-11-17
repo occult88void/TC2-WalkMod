@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<metadata>
+  <names>
+    <English>Avatar Physics Test</English>
+  </names>
+  <author>TC2 WalkMod Research</author>
+  <descriptions>
+    <English>Temporary experiment: doubles the base Avatar walking speed to test whether the Freedrive pedestrian uses AvatarSettings physics.</English>
+  </descriptions>
+  <files>
+    <file priority="996" loc="AvatarPhysicsTest.xml" />
+  </files>
+</metadata>
