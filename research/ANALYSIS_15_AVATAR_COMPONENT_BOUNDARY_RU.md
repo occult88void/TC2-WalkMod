@@ -62,6 +62,21 @@
 
 Не следует пытаться компенсировать отсутствие serialized movement component добавлением похожего NPC или HUD-компонента: в данных нет доказательства, что это создаст управляемого локального игрока.
 
+
+## 5. Проверка всех наследуемых AvatarTC2 archetypes
+
+Дополнительно агрегированы component records по всем 612 entity records класса CITEntityAvatarTC2, а не только по explicit base:
+
+| Компонент | Количество записей |
+|---|---:|
+| CITEntityComponentAvatarPuzzle | 511 |
+| CITEntityComponentAnimCtrl | 254 |
+| CITEntityComponentBinding | 128 |
+
+Других типов компонентов в этих 612 записях индекс не показывает. Следовательно, в полном наборе сериализованных AvatarTC2 archetypes не обнаружен отдельный movement/input/controller component.
+
+Ограничение: счётчики относятся к записям компонентов в archetype data. Они не учитывают native fields базового C++ класса, глобальные manager components и компоненты, которые могут добавляться динамически во время исполнения.
+
 ## Вывод
 
 Базовый AvatarTC2 не несёт очевидного serialized PlayerController/InputController компонента. Его видимые компоненты отвечают за привязку, внешний вид и анимацию; физика и камера вынесены в Avatar settings. Это делает native entity/controller path центральной недостающей частью расследования.
