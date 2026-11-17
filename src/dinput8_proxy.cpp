@@ -414,165 +414,283 @@ void CaptureManagerCandidate(const BYTE* image, SIZE_T imageSize, const std::wst
 }
 
 
-void CaptureComponentHostSnapshot(const BYTE* image, SIZE_T imageSize,
-                                  const wchar_t* label, const std::wstring& dir) {
-    constexpr DWORD kGlobalPointerRva = 0x0343C630u;
-    Log(L"=== COMPONENT HOST SNAPSHOT BEGIN label=%s (read-only) ===", label);
-    if (kGlobalPointerRva > imageSize || sizeof(std::uint64_t) > imageSize - kGlobalPointerRva) {
-        Log(L"COMPONENT_HOST_ABORT: label=%s reason=global_slot_outside_image", label);
+
+bool IsExecutableAddress(const BYTE* address) {
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(address, &mbi, sizeof(mbi)) != sizeof(mbi) ||
+        mbi.State != MEM_COMMIT || !Readable(mbi.Protect)) return false;
+    const DWORD p = mbi.Protect & 0xFF;
+    return p == PAGE_EXECUTE || p == PAGE_EXECUTE_READ ||
+           p == PAGE_EXECUTE_READWRITE || p == PAGE_EXECUTE_WRITECOPY;
+}
+
+void CaptureSlotVtableAndRtti(const BYTE* image, SIZE_T imageSize,
+                              const BYTE* object, const wchar_t* label,
+                              unsigned slot, const std::wstring& dir,
+                              std::vector<std::uint64_t>& capturedFunctions) {
+    std::uint64_t vtableValue = 0, owner10 = 0, owner18 = 0;
+    if (!ReadMemory(object, &vtableValue, sizeof(vtableValue))) {
+        Log(L"BOOT12_SLOT_ABORT: state=%s slot=0x%02X object=%p reason=object_read_failed error=%lu",
+            label, slot, object, GetLastError());
+        return;
+    }
+    ReadMemory(object + 0x10, &owner10, sizeof(owner10));
+    ReadMemory(object + 0x18, &owner18, sizeof(owner18));
+    Log(L"BOOT12_SLOT_OBJECT: state=%s slot=0x%02X object=%p vtable=%016llX field_10=%016llX field_18=%016llX",
+        label, slot, object, static_cast<unsigned long long>(vtableValue),
+        static_cast<unsigned long long>(owner10), static_cast<unsigned long long>(owner18));
+
+    wchar_t objectFile[128]{};
+    swprintf_s(objectFile, L"%s_slot_%02X_object.bin", label, slot);
+    CaptureWindow(object, 0x100, dir + L"\\" + objectFile, L"boot12_component_object");
+
+    const BYTE* vtable = reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(vtableValue));
+    constexpr SIZE_T kVtableEntries = 16;
+    std::uint64_t functions[kVtableEntries]{};
+    if (!vtableValue || !ReadMemory(vtable, functions, sizeof(functions))) {
+        Log(L"BOOT12_VTABLE_ABORT: state=%s slot=0x%02X vtable=%p reason=read_failed error=%lu",
+            label, slot, vtable, GetLastError());
         return;
     }
 
+    wchar_t vtableFile[128]{};
+    swprintf_s(vtableFile, L"%s_slot_%02X_vtable_16.bin", label, slot);
+    CaptureWindow(vtable, sizeof(functions), dir + L"\\" + vtableFile, L"boot12_vtable");
+
+    // On MSVC x64, the Complete Object Locator pointer is stored immediately
+    // before the first virtual-function pointer. Keep the raw bytes and validate
+    // the self-relative fields before interpreting them.
+    std::uint64_t locatorValue = 0;
+    if (vtableValue >= sizeof(std::uint64_t) &&
+        ReadMemory(vtable - sizeof(std::uint64_t), &locatorValue, sizeof(locatorValue))) {
+        const BYTE* locator = reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(locatorValue));
+        struct CompleteObjectLocator64 {
+            std::uint32_t signature;
+            std::uint32_t offset;
+            std::uint32_t cdOffset;
+            std::uint32_t typeDescriptorRva;
+            std::uint32_t classDescriptorRva;
+            std::uint32_t selfRva;
+        } col{};
+        if (locatorValue && ReadMemory(locator, &col, sizeof(col))) {
+            const std::uint64_t imageBase = reinterpret_cast<std::uint64_t>(image);
+            const std::uint64_t expectedSelf = imageBase + col.selfRva;
+            const bool imageRelative = col.signature == 1;
+            const bool selfMatches = imageRelative && expectedSelf == locatorValue;
+            Log(L"BOOT12_RTTI_COL: state=%s slot=0x%02X locator=%p signature=%u offset=0x%X cdOffset=0x%X typeDescRva=0x%08X classDescRva=0x%08X selfRva=0x%08X self_matches=%u",
+                label, slot, locator, col.signature, col.offset, col.cdOffset,
+                col.typeDescriptorRva, col.classDescriptorRva, col.selfRva,
+                selfMatches ? 1 : 0);
+            wchar_t colFile[128]{};
+            swprintf_s(colFile, L"%s_slot_%02X_rtti_col.bin", label, slot);
+            CaptureWindow(locator, sizeof(col), dir + L"\\" + colFile, L"boot12_rtti_col");
+
+            if (imageRelative && col.typeDescriptorRva < imageSize) {
+                wchar_t typeFile[128]{};
+                swprintf_s(typeFile, L"%s_slot_%02X_rtti_type_descriptor.bin", label, slot);
+                CaptureWindow(image + col.typeDescriptorRva, 0x80,
+                              dir + L"\\" + typeFile, L"boot12_rtti_type_descriptor");
+            }
+            if (imageRelative && col.classDescriptorRva < imageSize) {
+                wchar_t classFile[128]{};
+                swprintf_s(classFile, L"%s_slot_%02X_rtti_class_descriptor.bin", label, slot);
+                CaptureWindow(image + col.classDescriptorRva, 0x40,
+                              dir + L"\\" + classFile, L"boot12_rtti_class_descriptor");
+            }
+        } else {
+            Log(L"BOOT12_RTTI_UNRESOLVED: state=%s slot=0x%02X locator=%016llX reason=unreadable_or_invalid",
+                label, slot, static_cast<unsigned long long>(locatorValue));
+        }
+    } else {
+        Log(L"BOOT12_RTTI_UNRESOLVED: state=%s slot=0x%02X reason=locator_pointer_unreadable",
+            label, slot);
+    }
+
+    unsigned executableTargets = 0, duplicateTargets = 0;
+    for (SIZE_T i = 0; i < kVtableEntries; ++i) {
+        const std::uint64_t targetValue = functions[i];
+        const BYTE* target = reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(targetValue));
+        if (!targetValue || !IsExecutableAddress(target)) continue;
+        ++executableTargets;
+        if (std::find(capturedFunctions.begin(), capturedFunctions.end(), targetValue) != capturedFunctions.end()) {
+            ++duplicateTargets;
+            Log(L"BOOT12_VFUNC_DUPLICATE: state=%s slot=0x%02X index=%llu address=%p",
+                label, slot, static_cast<unsigned long long>(i), target);
+            continue;
+        }
+        capturedFunctions.push_back(targetValue);
+        wchar_t codeFile[160]{};
+        swprintf_s(codeFile, L"%s_slot_%02X_vfunc_%02llu_%016llX.bin",
+                   label, slot, static_cast<unsigned long long>(i),
+                   static_cast<unsigned long long>(targetValue));
+        const bool captured = CaptureWindow(target, 0x60, dir + L"\\" + codeFile, L"boot12_vfunc_code");
+        std::uint64_t rva = 0;
+        const std::uint64_t base = reinterpret_cast<std::uint64_t>(image);
+        if (targetValue >= base && targetValue - base < imageSize) rva = targetValue - base;
+        Log(L"BOOT12_VFUNC: state=%s slot=0x%02X index=%llu address=%p image_rva=0x%llX executable=1 captured=%u file=%s",
+            label, slot, static_cast<unsigned long long>(i), target,
+            static_cast<unsigned long long>(rva), captured ? 1 : 0, codeFile);
+    }
+    Log(L"BOOT12_VTABLE_SUMMARY: state=%s slot=0x%02X entries=%llu executable_targets=%u duplicate_targets=%u",
+        label, slot, static_cast<unsigned long long>(kVtableEntries),
+        executableTargets, duplicateTargets);
+}
+
+void CaptureComponentHostSnapshot(const BYTE* image, SIZE_T imageSize,
+                                  const wchar_t* label, const std::wstring& dir,
+                                  std::vector<std::uint64_t>& capturedFunctions) {
+    constexpr DWORD kGlobalPointerRva = 0x0343C630u;
+    constexpr unsigned kSlots[] = {0x1A, 0x1C};
+    constexpr unsigned kRequiredEntries = 0x1D;
+    Log(L"=== BOOTSTRAP12 TWO-STATE SLOT CAPTURE BEGIN state=%s (read-only) ===", label);
+
+    if (kGlobalPointerRva > imageSize || sizeof(std::uint64_t) > imageSize - kGlobalPointerRva) {
+        Log(L"BOOT12_ABORT: state=%s reason=global_slot_outside_image", label);
+        return;
+    }
     std::uint64_t host = 0;
     if (!ReadMemory(image + kGlobalPointerRva, &host, sizeof(host)) ||
         !PlausiblePointer(image, imageSize, host)) {
-        Log(L"COMPONENT_HOST_ABORT: label=%s reason=invalid_global_pointer value=%016llX",
+        Log(L"BOOT12_ABORT: state=%s reason=invalid_host_pointer value=%016llX",
             label, static_cast<unsigned long long>(host));
         return;
     }
 
     const BYTE* root = reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(host));
-    std::uint64_t table = 0, tableMeta = 0, selector = 0, selectorMeta = 0, cameraCandidate = 0;
-    const bool tableOk = ReadMemory(root + 0x1DD8, &table, sizeof(table));
-    const bool tableMetaOk = ReadMemory(root + 0x1DE0, &tableMeta, sizeof(tableMeta));
-    const bool selectorOk = ReadMemory(root + 0x1DE8, &selector, sizeof(selector));
-    const bool selectorMetaOk = ReadMemory(root + 0x1DF0, &selectorMeta, sizeof(selectorMeta));
-    ReadMemory(root + 0x1E68, &cameraCandidate, sizeof(cameraCandidate));
+    std::uint64_t table = 0, tableMeta = 0, selector = 0, selectorMeta = 0;
+    if (!ReadMemory(root + 0x1DD8, &table, sizeof(table)) ||
+        !ReadMemory(root + 0x1DE0, &tableMeta, sizeof(tableMeta))) {
+        Log(L"BOOT12_ABORT: state=%s reason=component_table_fields_unreadable", label);
+        return;
+    }
+    ReadMemory(root + 0x1DE8, &selector, sizeof(selector));
+    ReadMemory(root + 0x1DF0, &selectorMeta, sizeof(selectorMeta));
+    const std::uint32_t count = static_cast<std::uint32_t>(tableMeta & 0xFFFFFFFFu);
+    if (!PlausiblePointer(image, imageSize, table) ||
+        count < kRequiredEntries || count > 128) {
+        Log(L"BOOT12_ABORT: state=%s reason=invalid_table_or_count table=%016llX count=%u tableMeta=%016llX",
+            label, static_cast<unsigned long long>(table), count,
+            static_cast<unsigned long long>(tableMeta));
+        return;
+    }
 
-    std::uint32_t count = static_cast<std::uint32_t>(tableMeta & 0xFFFFFFFFu);
-    if (count == 0 || count > 128) count = 128;
-
-    Log(L"COMPONENT_HOST_ROOT: label=%s host=%p table=%p tableMeta=%016llX selector=%p selectorMeta=%016llX field_1E68=%016llX count=%u",
+    Log(L"BOOT12_HOST: state=%s host=%p table=%p tableMeta=%016llX count=%u selector=%016llX selectorMeta=%016llX",
         label, root, reinterpret_cast<void*>(static_cast<std::uintptr_t>(table)),
-        static_cast<unsigned long long>(tableMeta),
-        reinterpret_cast<void*>(static_cast<std::uintptr_t>(selector)),
-        static_cast<unsigned long long>(selectorMeta),
-        static_cast<unsigned long long>(cameraCandidate), count);
+        static_cast<unsigned long long>(tableMeta), count,
+        static_cast<unsigned long long>(selector),
+        static_cast<unsigned long long>(selectorMeta));
+    wchar_t rootFile[128]{};
+    swprintf_s(rootFile, L"%s_host_root.bin", label);
+    CaptureWindow(root, 0x2000, dir + L"\\" + rootFile, L"boot12_host_root");
 
-    std::wstring prefix = std::wstring(L"host_") + label;
-    CaptureWindow(root, 0x2000, dir + L"\\" + prefix + L"_root.bin", L"component_host_root");
-
-    if (tableOk && PlausiblePointer(image, imageSize, table)) {
-        CaptureWindow(reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(table)),
-                      static_cast<SIZE_T>(count) * sizeof(std::uint64_t),
-                      dir + L"\\" + prefix + L"_component_table.bin",
-                      L"component_host_pointer_table");
-    } else {
-        Log(L"COMPONENT_HOST_TABLE_SKIP: label=%s readable=%u pointer=%016llX",
-            label, tableOk ? 1 : 0, static_cast<unsigned long long>(table));
-    }
-
-    if (selectorOk && PlausiblePointer(image, imageSize, selector)) {
-        CaptureWindow(reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(selector)),
-                      0x400, dir + L"\\" + prefix + L"_selector_table.bin",
-                      L"component_host_selector_table");
-    } else {
-        Log(L"COMPONENT_HOST_SELECTOR_SKIP: label=%s readable=%u pointer=%016llX",
-            label, selectorOk ? 1 : 0, static_cast<unsigned long long>(selector));
-    }
-
-    if (PlausiblePointer(image, imageSize, cameraCandidate)) {
-        CaptureWindow(reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(cameraCandidate)),
-                      0x200, dir + L"\\" + prefix + L"_field_1E68_target.bin",
-                      L"component_host_field_1E68_target");
-    }
-
-    if (tableOk && PlausiblePointer(image, imageSize, table)) {
-        const BYTE* entries = reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(table));
-        for (std::uint32_t i = 0; i < count; ++i) {
-            std::uint64_t component = 0;
-            if (!ReadMemory(entries + static_cast<SIZE_T>(i) * sizeof(component),
-                            &component, sizeof(component))) break;
-            if (!PlausiblePointer(image, imageSize, component)) continue;
-
-            std::uint64_t vtable = 0, owner = 0;
-            const BYTE* object = reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(component));
-            ReadMemory(object, &vtable, sizeof(vtable));
-            ReadMemory(object + 0x18, &owner, sizeof(owner));
-
-            Log(L"COMPONENT_HOST_ENTRY: label=%s index=%u pointer=%016llX vtable=%016llX owner_plus_18=%016llX%s",
-                label, i, static_cast<unsigned long long>(component),
-                static_cast<unsigned long long>(vtable),
-                static_cast<unsigned long long>(owner),
-                i == 0x1C ? L" SLOT_1C_CANDIDATE_UNVERIFIED" : L"");
-
-            wchar_t file[128]{};
-            swprintf_s(file, L"%s_component_%03u.bin", label, i);
-            CaptureWindow(object, 0x100, dir + L"\\" + file, L"component_host_entry");
+    const SIZE_T tableBytes = static_cast<SIZE_T>(count) * sizeof(std::uint64_t);
+    std::vector<BYTE> stableSnapshot(tableBytes), verifySnapshot(tableBytes);
+    bool stable = false;
+    for (unsigned attempt = 1; attempt <= 3; ++attempt) {
+        if (!ReadMemory(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(table)),
+                        stableSnapshot.data(), tableBytes) ||
+            !ReadMemory(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(table)),
+                        verifySnapshot.data(), tableBytes)) {
+            Log(L"BOOT12_TABLE_READ_ERROR: state=%s attempt=%u error=%lu", label, attempt, GetLastError());
+            continue;
         }
+        if (memcmp(stableSnapshot.data(), verifySnapshot.data(), tableBytes) == 0) {
+            stable = true;
+            Log(L"BOOT12_TABLE_STABLE: state=%s attempt=%u bytes=0x%llX", label, attempt,
+                static_cast<unsigned long long>(tableBytes));
+            break;
+        }
+        Log(L"BOOT12_TABLE_CHANGED_DURING_READ: state=%s attempt=%u bytes=0x%llX",
+            label, attempt, static_cast<unsigned long long>(tableBytes));
+        Sleep(15);
+    }
+    if (!stable) {
+        Log(L"BOOT12_ABORT: state=%s reason=component_table_did_not_stabilize", label);
+        return;
     }
 
-    Log(L"=== COMPONENT HOST SNAPSHOT END label=%s ===", label);
+    wchar_t tableFile[128]{};
+    swprintf_s(tableFile, L"%s_component_table_stable.bin", label);
+    if (!WriteFileBytes(dir + L"\\" + tableFile, stableSnapshot.data(), stableSnapshot.size())) {
+        Log(L"BOOT12_ABORT: state=%s reason=table_snapshot_write_failed", label);
+        return;
+    }
+
+    // All subsequent slot lookups use this one immutable local copy. Never
+    // reread individual live table entries after the snapshot is accepted.
+    for (unsigned slot : kSlots) {
+        std::uint64_t component = 0;
+        memcpy(&component, stableSnapshot.data() + static_cast<SIZE_T>(slot) * 8, 8);
+        if (!PlausiblePointer(image, imageSize, component)) {
+            Log(L"BOOT12_SLOT_SKIP: state=%s slot=0x%02X value=%016llX reason=not_plausible_component_pointer",
+                label, slot, static_cast<unsigned long long>(component));
+            continue;
+        }
+        const BYTE* object = reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(component));
+        Log(L"BOOT12_SLOT_SELECTED: state=%s slot=0x%02X object=%p table_snapshot=1",
+            label, slot, object);
+        CaptureSlotVtableAndRtti(image, imageSize, object, label, slot, dir, capturedFunctions);
+    }
+    Log(L"=== BOOTSTRAP12 TWO-STATE SLOT CAPTURE END state=%s ===", label);
 }
 
-std::wstring RunCapture() {
+std::wstring RunCapture(std::vector<std::uint64_t>& capturedFunctions) {
     HMODULE module = GetModuleHandleW(nullptr);
-    if (!module) { Log(L"TARGET_CAPTURE_ABORT: main module unavailable"); return L""; }
+    if (!module) { Log(L"BOOT12_ABORT: main module unavailable"); return L""; }
     const BYTE* image = reinterpret_cast<const BYTE*>(module);
     IMAGE_DOS_HEADER dos{};
     if (!ReadMemory(image, &dos, sizeof(dos)) || dos.e_magic != IMAGE_DOS_SIGNATURE) {
-        Log(L"TARGET_CAPTURE_ABORT: invalid DOS header"); return L"";
+        Log(L"BOOT12_ABORT: invalid DOS header"); return L"";
     }
     IMAGE_NT_HEADERS64 nt{};
     if (!ReadMemory(image + dos.e_lfanew, &nt, sizeof(nt)) ||
         nt.Signature != IMAGE_NT_SIGNATURE || nt.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
         nt.FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64) {
-        Log(L"TARGET_CAPTURE_ABORT: invalid PE64/AMD64 image"); return L"";
+        Log(L"BOOT12_ABORT: invalid PE64/AMD64 image"); return L"";
     }
-    Log(L"TARGET_CAPTURE_IMAGE: base=%p size=0x%08X timestamp=0x%08X machine=0x%04X",
+    Log(L"BOOT12_IMAGE: base=%p size=0x%08X timestamp=0x%08X machine=0x%04X",
         module, nt.OptionalHeader.SizeOfImage, nt.FileHeader.TimeDateStamp, nt.FileHeader.Machine);
     if (nt.OptionalHeader.SizeOfImage != kImageSize || nt.FileHeader.TimeDateStamp != kImageTimestamp) {
-        Log(L"TARGET_CAPTURE_ABORT: executable fingerprint mismatch expected_size=0x%08X expected_timestamp=0x%08X",
+        Log(L"BOOT12_ABORT: executable fingerprint mismatch expected_size=0x%08X expected_timestamp=0x%08X",
             kImageSize, kImageTimestamp);
         return L"";
     }
-
     std::wstring dir = NewCaptureDirectory();
     if (dir.empty()) return L"";
-    Log(L"TARGET_CAPTURE_DIRECTORY: %s", dir.c_str());
-    Log(L"=== TARGETED TYPE DESCRIPTOR CAPTURE BEGIN (read-only) ===");
-    const Target targets[] = {
-        {L"avatar_tc2", 0x0344F430u},
-        {L"human_player", 0x0342CCC8u},
-        {L"ghost_player", 0x0342CDE0u},
-        {L"avatar_parent_descriptor", 0x0386C3B0u},
-        {L"player_shared_parent_descriptor", 0x038AE500u},
-        {L"mission_spawn_registry", 0x038B7430u},
-    };
-    std::vector<ObjectRef> objects;
-    for (const auto& target : targets) CaptureDescriptor(image, nt.OptionalHeader.SizeOfImage, target, dir, objects);
-    CaptureObjects(objects, dir);
-    Log(L"=== TARGETED TYPE DESCRIPTOR CAPTURE END ===");
-    CaptureNativeCode(image, nt.OptionalHeader.SizeOfImage, nt, dir);
+    Log(L"BOOT12_CAPTURE_DIRECTORY: %s", dir.c_str());
     CaptureComponentHostSnapshot(image, nt.OptionalHeader.SizeOfImage,
-                                 L"01_FREEDRIVE_VEHICLE", dir);
-    Log(L"TARGET_CAPTURE_COMPLETE: directory=%s", dir.c_str());
+                                 L"01_FREEDRIVE_VEHICLE", dir, capturedFunctions);
     return dir;
 }
 
 DWORD WINAPI Worker(LPVOID) {
     wchar_t exe[MAX_PATH]{};
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
-    Log(L"=== TC2 Walkmod diagnostic bootstrap 11 (read-only component-host snapshots) ===");
-    Log(L"BOOTSTRAP_VERSION: 11");
-    Log(L"PROBE_MODE: read-only; no MinHook; no code patches; no memory writes to game");
+    Log(L"=== TC2 Walkmod diagnostic bootstrap 12 (two-state slot/vtable/RTTI capture) ===");
+    Log(L"BOOTSTRAP_VERSION: 12");
+    Log(L"PROBE_MODE: read-only; no hooks; no code patches; no game-memory writes");
+    Log(L"TEST_SCENARIOS: 01_FREEDRIVE_VEHICLE then 02_HQ_PEDESTRIAN only");
+    Log(L"EXCLUDED: Leave action and open-world pedestrian scenario are not part of this capture");
     Log(L"Game executable: %s", exe);
 
+    std::vector<std::uint64_t> capturedFunctions;
     if (!WaitForHotkey(VK_F10, L"01_FREEDRIVE_VEHICLE")) return 0;
-    std::wstring dir = RunCapture();
+    std::wstring dir = RunCapture(capturedFunctions);
     if (dir.empty()) return 0;
 
-    if (WaitForHotkey(VK_F11, L"02_HQ_PEDESTRIAN")) {
-        HMODULE module = GetModuleHandleW(nullptr);
-        if (module) CaptureComponentHostSnapshot(reinterpret_cast<const BYTE*>(module),
-                                                   kImageSize, L"02_HQ_PEDESTRIAN", dir);
+    if (!WaitForHotkey(VK_F11, L"02_HQ_PEDESTRIAN")) {
+        Log(L"BOOT12_SEQUENCE_INCOMPLETE: HQ snapshot was not triggered; directory=%s", dir.c_str());
+        return 0;
     }
-    if (WaitForHotkey(VK_F12, L"03_OPEN_WORLD_PEDESTRIAN")) {
-        HMODULE module = GetModuleHandleW(nullptr);
-        if (module) CaptureComponentHostSnapshot(reinterpret_cast<const BYTE*>(module),
-                                                   kImageSize, L"03_OPEN_WORLD_PEDESTRIAN", dir);
+    HMODULE module = GetModuleHandleW(nullptr);
+    if (!module) {
+        Log(L"BOOT12_HQ_ABORT: main module unavailable");
+        return 0;
     }
-    Log(L"BOOTSTRAP11_SEQUENCE_COMPLETE: directory=%s", dir.c_str());
+    CaptureComponentHostSnapshot(reinterpret_cast<const BYTE*>(module),
+                                 kImageSize, L"02_HQ_PEDESTRIAN", dir, capturedFunctions);
+    Log(L"BOOTSTRAP12_SEQUENCE_COMPLETE: directory=%s unique_vfuncs=%llu",
+        dir.c_str(), static_cast<unsigned long long>(capturedFunctions.size()));
     return 0;
 }
 
