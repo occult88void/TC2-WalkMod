@@ -829,7 +829,14 @@ void CaptureBootstrap16CodeTargets(const BYTE* image, SIZE_T imageSize,
         {L"host_state_helper_00ECCC50", 0x00ECCC50u, 0x300},
         {L"host_state_helper_00F092E0", 0x00F092E0u, 0x300},
         {L"host_state_helper_01890D90", 0x01890D90u, 0x300},
-        {L"host_state_helper_04522B0", 0x04522B0u, 0x300}
+        {L"host_state_helper_04522B0", 0x04522B0u, 0x300},
+
+        // Transform accessor chain and the post-Leave Host+0x948 gate.
+        {L"transform_owner_getter_119EBE0", 0x0119EBE0u, 0x300},
+        {L"transform_bundle_accessor_119FC60", 0x0119FC60u, 0x300},
+        {L"host_handoff_gate_0062A6D0", 0x0062A6D0u, 0x700},
+        {L"host_handoff_gate_callee_005289D0", 0x005289D0u, 0x300},
+        {L"host_handoff_gate_callee_1DA7870", 0x1DA7870u, 0x400}
     };
     unsigned captured = 0, skipped = 0;
     for (const auto& target : targets) {
@@ -850,7 +857,8 @@ void CaptureTransitionHostSnapshot(const BYTE* image, SIZE_T imageSize,
     constexpr DWORD stateReferenceOffsets[] = {0x538u, 0x548u, 0x5B8u, 0x5C8u};
     constexpr DWORD hostPointerOffsets[] = {0x2480u, 0x1ED0u, 0x1EF8u};
     constexpr DWORD hostTailOffsets[] = {0x2BC8u, 0x2C08u, 0x2D08u};
-    Log(L"=== BOOTSTRAP16 TARGETED HOST/HANDOFF SNAPSHOT BEGIN state=%s (read-only) ===", label);
+    constexpr DWORD handoffReferenceOffsets[] = {0x638u, 0x648u, 0x938u, 0x948u};
+    Log(L"=== BOOTSTRAP17 TARGETED TRANSFORM/OWNERSHIP SNAPSHOT BEGIN state=%s (read-only) ===", label);
     if (kGlobalPointerRva > imageSize || sizeof(std::uint64_t) > imageSize - kGlobalPointerRva) {
         Log(L"BOOT16_HOST_ABORT: state=%s reason=global_slot_outside_image", label);
         return;
@@ -905,6 +913,15 @@ void CaptureTransitionHostSnapshot(const BYTE* image, SIZE_T imageSize,
             CaptureStableWindow(reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(value)),
                                 0x200, dir + L"\\" + file, L"boot16_host_state_reference");
         }
+    }
+
+    // Bootstrap16 showed that +0x638 and +0x938 become interior pointers
+    // after native HQ Leave. Capture both pointer fields and their targets,
+    // together with the adjacent enable flags.
+    for (DWORD offset : handoffReferenceOffsets) {
+        wchar_t refLabel[128]{};
+        swprintf_s(refLabel, L"%s_host_handoff", label);
+        CaptureInteriorReference15(image, imageSize, root, offset, refLabel, dir);
     }
 
     for (DWORD offset : hostTailOffsets) {
@@ -1012,9 +1029,17 @@ void CaptureTransitionHostSnapshot(const BYTE* image, SIZE_T imageSize,
         const BYTE* component = reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(componentValue));
         SIZE_T requested = 0x400;
         const unsigned selectorOffset = logicalOffsets[i];
-        if (selectorOffset == 0x03u || selectorOffset == 0x11u || selectorOffset == 0x30u)
+        if (selectorOffset == 0x03u)
+            requested = 0xC00;
+        else if (selectorOffset == 0x11u)
+            requested = 0x3800;
+        else if (selectorOffset == 0x1Cu)
+            requested = 0x1A00;
+        else if (selectorOffset == 0x22u)
+            requested = 0x800;
+        else if (selectorOffset == 0x30u)
             requested = 0x1800;
-        else if (selectorOffset == 0x06u || selectorOffset == 0x1Cu || selectorOffset == 0x23u ||
+        else if (selectorOffset == 0x06u || selectorOffset == 0x23u ||
                  selectorOffset == 0x04u || selectorOffset == 0x0Bu || selectorOffset == 0x20u ||
                  selectorOffset == 0x41u || selectorOffset == 0x44u)
             requested = 0x800;
@@ -1031,16 +1056,24 @@ void CaptureTransitionHostSnapshot(const BYTE* image, SIZE_T imageSize,
         CaptureFirstPointerTarget16(image, imageSize, nt, component,
                                     logicalLabel, dir, capturedFunctions);
 
-        if (selectorOffset == 0x03u)
+        if (selectorOffset == 0x03u) {
+            CaptureInteriorReference15(image, imageSize, component, 0xA90, logicalLabel, dir);
             CaptureInteriorReference15(image, imageSize, component, 0xF30, logicalLabel, dir);
-        if (selectorOffset == 0x11u)
+        }
+        if (selectorOffset == 0x11u) {
+            CaptureInteriorReference15(image, imageSize, component, 0x3A0, logicalLabel, dir);
             CaptureInteriorReference15(image, imageSize, component, 0x1258, logicalLabel, dir);
+            CaptureInteriorReference15(image, imageSize, component, 0x3198, logicalLabel, dir);
+        }
+        if (selectorOffset == 0x1Cu)
+            CaptureInteriorReference15(image, imageSize, component, 0x1518, logicalLabel, dir);
     }
 
     Log(L"BOOT16_CAPTURE_SUMMARY: state=%s table_entries=%u selected_components=%llu code_functions=%llu",
         label, count, static_cast<unsigned long long>(_countof(logicalOffsets)),
         static_cast<unsigned long long>(capturedFunctions.size()));
-    Log(L"=== BOOTSTRAP16 TARGETED HOST/HANDOFF SNAPSHOT END state=%s ===", label);
+    Log(L"BOOT17_TARGET_SUMMARY: state=%s transform_accessor=0x119FC60 owner_getter=0x119EBE0 handoff_refs=0x638,0x938 component_tails=0x11:+0x3198;0x1C:+0x1518", label);
+    Log(L"=== BOOTSTRAP17 TARGETED TRANSFORM/OWNERSHIP SNAPSHOT END state=%s ===", label);
 }
 
 void CaptureSlotVtableAndRtti(const BYTE* image, SIZE_T imageSize,
@@ -1255,28 +1288,28 @@ void CaptureComponentHostSnapshot(const BYTE* image, SIZE_T imageSize,
 
 std::wstring RunCapture() {
     HMODULE module = GetModuleHandleW(nullptr);
-    if (!module) { Log(L"BOOT16_ABORT: main module unavailable"); return L""; }
+    if (!module) { Log(L"BOOT17_ABORT: main module unavailable"); return L""; }
     const BYTE* image = reinterpret_cast<const BYTE*>(module);
     IMAGE_DOS_HEADER dos{};
     if (!ReadMemory(image, &dos, sizeof(dos)) || dos.e_magic != IMAGE_DOS_SIGNATURE) {
-        Log(L"BOOT16_ABORT: invalid DOS header"); return L"";
+        Log(L"BOOT17_ABORT: invalid DOS header"); return L"";
     }
     IMAGE_NT_HEADERS64 nt{};
     if (!ReadMemory(image + dos.e_lfanew, &nt, sizeof(nt)) ||
         nt.Signature != IMAGE_NT_SIGNATURE || nt.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
         nt.FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64) {
-        Log(L"BOOT16_ABORT: invalid PE64/AMD64 image"); return L"";
+        Log(L"BOOT17_ABORT: invalid PE64/AMD64 image"); return L"";
     }
-    Log(L"BOOT16_IMAGE: base=%p size=0x%08X timestamp=0x%08X machine=0x%04X",
+    Log(L"BOOT17_IMAGE: base=%p size=0x%08X timestamp=0x%08X machine=0x%04X",
         module, nt.OptionalHeader.SizeOfImage, nt.FileHeader.TimeDateStamp, nt.FileHeader.Machine);
     if (nt.OptionalHeader.SizeOfImage != kImageSize || nt.FileHeader.TimeDateStamp != kImageTimestamp) {
-        Log(L"BOOT16_ABORT: executable fingerprint mismatch expected_size=0x%08X expected_timestamp=0x%08X",
+        Log(L"BOOT17_ABORT: executable fingerprint mismatch expected_size=0x%08X expected_timestamp=0x%08X",
             kImageSize, kImageTimestamp);
         return L"";
     }
     std::wstring dir = NewCaptureDirectory();
     if (dir.empty()) return L"";
-    Log(L"BOOT16_CAPTURE_DIRECTORY: %s", dir.c_str());
+    Log(L"BOOT17_CAPTURE_DIRECTORY: %s", dir.c_str());
     CaptureBootstrap16CodeTargets(image, nt.OptionalHeader.SizeOfImage, nt, dir);
     CaptureTransitionHostSnapshot(image, nt.OptionalHeader.SizeOfImage, nt,
                                   L"01_FREEDRIVE_VEHICLE", dir);
@@ -1285,10 +1318,10 @@ std::wstring RunCapture() {
 DWORD WINAPI Worker(LPVOID) {
     wchar_t exe[MAX_PATH]{};
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
-    Log(L"=== TC2 Walkmod diagnostic bootstrap 16 (targeted HQ Leave handoff) ===");
-    Log(L"BOOTSTRAP_VERSION: 16");
+    Log(L"=== TC2 Walkmod diagnostic bootstrap 17 (transform ownership and HQ handoff) ===");
+    Log(L"BOOTSTRAP_VERSION: 17");
     Log(L"PROBE_MODE: read-only; no hooks; no code patches; no game-memory writes; no game functions invoked");
-    Log(L"BOOT16_SCOPE: Host+0x2480/+0x1ED0/+0x1EF8; state callbacks; selector bytes 0x80; selected components");
+    Log(L"BOOT17_SCOPE: component 0x03/0x11/0x1C/0x22 tails; Host+0x638/+0x938 references and flags; transform getter 0x119FC60; owner getter 0x119EBE0; Host+0x948 gate 0x62A6D0");
     Log(L"TEST_SCENARIOS: F10 Freedrive vehicle; F11 HQ pedestrian before Leave; F12 after native HQ Leave");
     Log(L"IMPORTANT: trigger Leave manually in-game between F11 and F12; DLL never calls Leave");
     Log(L"EXCLUDED: no attempt to leave a Freedrive vehicle; no forced spawn or teleport");
@@ -1299,12 +1332,12 @@ DWORD WINAPI Worker(LPVOID) {
     if (dir.empty()) return 0;
 
     if (!WaitForHotkey(VK_F11, L"02_HQ_PEDESTRIAN_BEFORE_LEAVE")) {
-        Log(L"BOOT16_SEQUENCE_INCOMPLETE: HQ pre-Leave snapshot missing; directory=%s", dir.c_str());
+        Log(L"BOOT17_SEQUENCE_INCOMPLETE: HQ pre-Leave snapshot missing; directory=%s", dir.c_str());
         return 0;
     }
     HMODULE module = GetModuleHandleW(nullptr);
     if (!module) {
-        Log(L"BOOT16_HQ_ABORT: main module unavailable");
+        Log(L"BOOT17_HQ_ABORT: main module unavailable");
         return 0;
     }
     IMAGE_DOS_HEADER dos{};
@@ -1315,7 +1348,7 @@ DWORD WINAPI Worker(LPVOID) {
         nt.Signature != IMAGE_NT_SIGNATURE || nt.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
         nt.FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 ||
         nt.OptionalHeader.SizeOfImage != kImageSize || nt.FileHeader.TimeDateStamp != kImageTimestamp) {
-        Log(L"BOOT16_HQ_ABORT: invalid module headers or executable fingerprint");
+        Log(L"BOOT17_HQ_ABORT: invalid module headers or executable fingerprint");
         return 0;
     }
     CaptureTransitionHostSnapshot(image, nt.OptionalHeader.SizeOfImage, nt,
@@ -1323,12 +1356,12 @@ DWORD WINAPI Worker(LPVOID) {
 
     Log(L"BOOT16_ACTION_REQUIRED: now use the game's native Leave action in HQ; wait for the transition to finish, then press Ctrl+Shift+F12");
     if (!WaitForHotkey(VK_F12, L"03_AFTER_HQ_LEAVE")) {
-        Log(L"BOOT16_SEQUENCE_INCOMPLETE: post-Leave snapshot missing; directory=%s", dir.c_str());
+        Log(L"BOOT17_SEQUENCE_INCOMPLETE: post-Leave snapshot missing; directory=%s", dir.c_str());
         return 0;
     }
     CaptureTransitionHostSnapshot(image, nt.OptionalHeader.SizeOfImage, nt,
                                   L"03_AFTER_HQ_LEAVE", dir);
-    Log(L"BOOTSTRAP16_SEQUENCE_COMPLETE: directory=%s", dir.c_str());
+    Log(L"BOOTSTRAP17_SEQUENCE_COMPLETE: directory=%s", dir.c_str());
     return 0;
 }
 bool LoadOriginal() {
