@@ -786,6 +786,7 @@ void CaptureTransitionHostSnapshot(const BYTE* image, SIZE_T imageSize,
     for (DWORD offset : wrapperOffsets)
         CaptureHostWrapperDepth15(image, imageSize, nt, root, offset, label, dir, capturedFunctions);
 
+    std::vector<std::uint64_t> directHostObjects;
     for (DWORD offset : directObjectOffsets) {
         std::uint64_t value = 0;
         if (!ReadMemory(root + offset, &value, sizeof(value))) continue;
@@ -794,7 +795,7 @@ void CaptureTransitionHostSnapshot(const BYTE* image, SIZE_T imageSize,
         wchar_t objectLabel[128]{};
         swprintf_s(objectLabel, L"%s_host_field_%04X", label, offset);
         CaptureObjectAndVtable(image, imageSize, nt, value, objectLabel, dir,
-                               *new std::vector<std::uint64_t>(), capturedFunctions);
+                               directHostObjects, capturedFunctions);
     }
 
     for (DWORD offset : stateReferenceOffsets) {
