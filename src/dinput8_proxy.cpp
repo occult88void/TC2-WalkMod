@@ -713,19 +713,24 @@ void CaptureHostWrapperDepth15(const BYTE* image, SIZE_T imageSize, const IMAGE_
 
 void CaptureInteriorReference15(const BYTE* image, SIZE_T imageSize, const BYTE* owner,
                                 SIZE_T offset, const wchar_t* label, const std::wstring& dir) {
+    wchar_t fieldFile[192]{};
+    swprintf_s(fieldFile, L"%s_interior_%04llX.bin", label, static_cast<unsigned long long>(offset));
+    CaptureStableWindow(owner + offset, 0x200, dir + L"\\" + fieldFile,
+                        L"boot15_interior_address");
     std::uint64_t value = 0;
     if (!ReadMemory(owner + offset, &value, sizeof(value))) {
         Log(L"BOOT15_INTERIOR_REF_SKIP: label=%s offset=0x%llX reason=unreadable",
             label, static_cast<unsigned long long>(offset));
         return;
     }
-    Log(L"BOOT15_INTERIOR_REF: label=%s offset=0x%llX value=%016llX",
-        label, static_cast<unsigned long long>(offset), static_cast<unsigned long long>(value));
+    Log(L"BOOT15_INTERIOR_REF: label=%s offset=0x%llX address=%p qword=%016llX",
+        label, static_cast<unsigned long long>(offset), owner + offset,
+        static_cast<unsigned long long>(value));
     if (!PlausiblePointer(image, imageSize, value)) return;
     wchar_t file[192]{};
     swprintf_s(file, L"%s_ref_%04llX.bin", label, static_cast<unsigned long long>(offset));
     CaptureStableWindow(reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(value)),
-                        0x200, dir + L"\\" + file, L"boot15_interior_reference");
+                        0x200, dir + L"\\" + file, L"boot15_interior_reference_target");
 }
 
 void CaptureBootstrap15CodeTargets(const BYTE* image, SIZE_T imageSize,
