@@ -1145,9 +1145,16 @@ void CaptureTransitionHostSnapshot(const BYTE* image, SIZE_T imageSize,
         if (selectorOffset == 0x11u) {
             CaptureInteriorReference15(image, imageSize, component, 0x1258, logicalLabel, dir);
             CaptureInteriorReference15(image, imageSize, component, 0x3198, logicalLabel, dir);
+            wchar_t subobjectLabel[160]{};
+            swprintf_s(subobjectLabel, L"%s_handoff_subobject_3198", logicalLabel);
+            CaptureComponentRtti17(image, imageSize, component + 0x3198, subobjectLabel, dir);
         }
-        if (selectorOffset == 0x1Cu)
+        if (selectorOffset == 0x1Cu) {
             CaptureInteriorReference15(image, imageSize, component, 0x1518, logicalLabel, dir);
+            wchar_t subobjectLabel[160]{};
+            swprintf_s(subobjectLabel, L"%s_handoff_subobject_1518", logicalLabel);
+            CaptureComponentRtti17(image, imageSize, component + 0x1518, subobjectLabel, dir);
+        }
 
         if (selectorOffset == 0x03u || selectorOffset == 0x11u ||
             selectorOffset == 0x1Cu || selectorOffset == 0x22u ||
