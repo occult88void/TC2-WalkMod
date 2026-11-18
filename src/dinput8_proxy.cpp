@@ -252,7 +252,7 @@ void CaptureDescriptor(const BYTE* image, SIZE_T imageSize, const Target& target
 
 bool WaitForHotkey(int key, const wchar_t* label) {
     Log(L"SNAPSHOT_WAIT: label=%s hotkey=Ctrl+Shift+F%d timeout=10min",
-        label, key == VK_F10 ? 10 : (key == VK_F11 ? 11 : 12));
+        label, key == VK_F10 ? 10 : (key == VK_F11 ? 11 : (key == VK_F12 ? 12 : 13)));
     ULONGLONG deadline = GetTickCount64() + 10ull * 60ull * 1000ull;
     bool wasDown = false;
     while (GetTickCount64() < deadline) {
@@ -1409,7 +1409,7 @@ DWORD WINAPI Worker(LPVOID) {
     Log(L"BOOTSTRAP_VERSION: 17");
     Log(L"PROBE_MODE: read-only; no hooks; no code patches; no game-memory writes; no game functions invoked");
     Log(L"BOOT17_SCOPE: transform getter/callee; Host+0x638/+0x938 handoff targets; selected component RTTI and interior records");
-    Log(L"TEST_SCENARIOS: F10 Freedrive vehicle; F11 HQ pedestrian before Leave; F12 after native HQ Leave");
+    Log(L"TEST_SCENARIOS: F10 Freedrive vehicle; F11 HQ pedestrian before Leave; F12 immediately after native HQ Leave; F13 after walking 5-10m");
     Log(L"IMPORTANT: trigger Leave manually in-game between F11 and F12; DLL never calls Leave");
     Log(L"EXCLUDED: no attempt to leave a Freedrive vehicle; no forced spawn or teleport");
     Log(L"Game executable: %s", exe);
@@ -1441,13 +1441,20 @@ DWORD WINAPI Worker(LPVOID) {
     CaptureTransitionHostSnapshot(image, nt.OptionalHeader.SizeOfImage, nt,
                                   L"02_HQ_PEDESTRIAN_BEFORE_LEAVE", dir);
 
-    Log(L"BOOT16_ACTION_REQUIRED: now use the game's native Leave action in HQ; wait for the transition to finish, then press Ctrl+Shift+F12");
+    Log(L"BOOT17_ACTION_REQUIRED: use the game's native Leave action in HQ; wait for the transition to finish, then press Ctrl+Shift+F12 immediately; after that walk 5-10m in the open world, stop, and press Ctrl+Shift+F13");
     if (!WaitForHotkey(VK_F12, L"03_AFTER_HQ_LEAVE")) {
         Log(L"BOOT16_SEQUENCE_INCOMPLETE: post-Leave snapshot missing; directory=%s", dir.c_str());
         return 0;
     }
     CaptureTransitionHostSnapshot(image, nt.OptionalHeader.SizeOfImage, nt,
                                   L"03_AFTER_HQ_LEAVE", dir);
+
+    if (!WaitForHotkey(VK_F13, L"04_AFTER_HQ_LEAVE_WALK")) {
+        Log(L"BOOT17_SEQUENCE_INCOMPLETE: post-walk snapshot missing; directory=%s", dir.c_str());
+        return 0;
+    }
+    CaptureTransitionHostSnapshot(image, nt.OptionalHeader.SizeOfImage, nt,
+                                  L"04_AFTER_HQ_LEAVE_WALK", dir);
     Log(L"BOOTSTRAP17_SEQUENCE_COMPLETE: directory=%s", dir.c_str());
     return 0;
 }
