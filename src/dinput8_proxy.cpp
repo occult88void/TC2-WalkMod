@@ -787,6 +787,97 @@ void CaptureInteriorReference15(const BYTE* image, SIZE_T imageSize, const BYTE*
                         0x200, dir + L"\\" + file, L"boot15_interior_reference_target");
 }
 
+
+void CaptureComponentRtti17(const BYTE* image, SIZE_T imageSize,
+                            const BYTE* object, const wchar_t* label,
+                            const std::wstring& dir) {
+    std::uint64_t vtableValue = 0, locatorValue = 0;
+    if (!object || !ReadMemory(object, &vtableValue, sizeof(vtableValue)) ||
+        !IsCanonicalAlignedPointer(vtableValue)) {
+        Log(L"BOOT17_RTTI_SKIP: label=%s reason=invalid_object_or_vtable", label);
+        return;
+    }
+    const BYTE* vtable = reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(vtableValue));
+    if (vtableValue < sizeof(std::uint64_t) ||
+        !ReadMemory(vtable - sizeof(std::uint64_t), &locatorValue, sizeof(locatorValue))) {
+        Log(L"BOOT17_RTTI_SKIP: label=%s vtable=%p reason=locator_unreadable",
+            label, vtable);
+        return;
+    }
+    wchar_t prefix[160]{};
+    swprintf_s(prefix, L"%s_rtti", label);
+    CaptureStableWindow(vtable - 0x10, 0x10,
+                        dir + L"\\" + prefix + L"_vtable_prefix.bin",
+                        L"boot17_vtable_prefix");
+    const std::uint64_t imageBase = reinterpret_cast<std::uint64_t>(image);
+    if (locatorValue < imageBase || locatorValue - imageBase >= imageSize) {
+        Log(L"BOOT17_RTTI_UNRESOLVED: label=%s vtable=%p locator=%016llX reason=locator_outside_image",
+            label, vtable, static_cast<unsigned long long>(locatorValue));
+        return;
+    }
+    struct CompleteObjectLocator64 {
+        std::uint32_t signature;
+        std::uint32_t offset;
+        std::uint32_t cdOffset;
+        std::uint32_t typeDescriptorRva;
+        std::uint32_t classDescriptorRva;
+        std::uint32_t selfRva;
+    } col{};
+    const BYTE* locator = reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(locatorValue));
+    if (!ReadMemory(locator, &col, sizeof(col))) {
+        Log(L"BOOT17_RTTI_UNRESOLVED: label=%s locator=%p reason=col_unreadable", label, locator);
+        return;
+    }
+    wchar_t colFile[192]{};
+    swprintf_s(colFile, L"%s_rtti_col.bin", label);
+    CaptureStableWindow(locator, sizeof(col), dir + L"\\" + colFile, L"boot17_rtti_col");
+    const bool valid = col.signature == 1 &&
+        col.typeDescriptorRva < imageSize &&
+        col.classDescriptorRva < imageSize &&
+        col.selfRva < imageSize &&
+        imageBase + col.selfRva == locatorValue;
+    Log(L"BOOT17_RTTI_COL: label=%s locator=%p signature=%u offset=0x%X cdOffset=0x%X type_rva=0x%08X class_rva=0x%08X self_rva=0x%08X self_matches=%u valid=%u",
+        label, locator, col.signature, col.offset, col.cdOffset,
+        col.typeDescriptorRva, col.classDescriptorRva, col.selfRva,
+        imageBase + col.selfRva == locatorValue ? 1 : 0, valid ? 1 : 0);
+    if (!valid || col.typeDescriptorRva > imageSize - 0x80 ||
+        col.classDescriptorRva > imageSize - 0x40) return;
+
+    const BYTE* typeDescriptor = image + col.typeDescriptorRva;
+    const BYTE* classDescriptor = image + col.classDescriptorRva;
+    wchar_t typeFile[192]{}, classFile[192]{};
+    swprintf_s(typeFile, L"%s_rtti_type_descriptor.bin", label);
+    swprintf_s(classFile, L"%s_rtti_class_descriptor.bin", label);
+    CaptureStableWindow(typeDescriptor, 0x80, dir + L"\\" + typeFile,
+                        L"boot17_rtti_type_descriptor");
+    CaptureStableWindow(classDescriptor, 0x40, dir + L"\\" + classFile,
+                        L"boot17_rtti_class_descriptor");
+    char typeName[160]{};
+    if (ReadMemory(typeDescriptor + 0x10, typeName, sizeof(typeName) - 1)) {
+        typeName[sizeof(typeName) - 1] = 0;
+        Log(L"BOOT17_RTTI_TYPE_NAME: label=%s name=%S", label, typeName);
+    }
+}
+
+void CaptureBootstrap17CodeTargets(const BYTE* image, SIZE_T imageSize,
+                                   const IMAGE_NT_HEADERS64& nt, const std::wstring& dir) {
+    const CodeTarget targets[] = {
+        {L"transform_getter_119FC10",       0x0119FC10u, 0x180},
+        {L"transform_getter_helper_119EBE0",0x0119EBE0u, 0x300},
+        {L"host_transform_gate_062A6D0",    0x0062A6D0u, 0x500},
+        {L"host_transform_consumer_177D1A0",0x0177D1A0u, 0x300}
+    };
+    unsigned captured = 0, skipped = 0;
+    for (const auto& target : targets) {
+        if (CaptureCodeRva15(image, imageSize, nt, target.rva, target.size, target.name, dir))
+            ++captured;
+        else
+            ++skipped;
+    }
+    Log(L"BOOT17_CODE_TARGET_SUMMARY: targets=%llu captured=%u skipped=%u",
+        static_cast<unsigned long long>(_countof(targets)), captured, skipped);
+}
+
 void CaptureBootstrap16CodeTargets(const BYTE* image, SIZE_T imageSize,
                                    const IMAGE_NT_HEADERS64& nt, const std::wstring& dir) {
     const CodeTarget targets[] = {
@@ -923,6 +1014,22 @@ void CaptureTransitionHostSnapshot(const BYTE* image, SIZE_T imageSize,
         }
     }
 
+    // Bootstrap17: capture only the newly observed handoff references and their
+    // pointed-to interior records. This is a read-only snapshot, not a hook.
+    for (DWORD offset : {0x638u, 0x648u, 0x760u, 0x938u, 0x948u}) {
+        std::uint64_t value = 0;
+        if (!ReadMemory(root + offset, &value, sizeof(value))) continue;
+        Log(L"BOOT17_HOST_HANDOFF_FIELD: state=%s offset=0x%X address=%p value=%016llX",
+            label, offset, root + offset, static_cast<unsigned long long>(value));
+        if ((offset == 0x638u || offset == 0x938u || offset == 0x760u) &&
+            PlausiblePointer(image, imageSize, value)) {
+            wchar_t targetFile[160]{};
+            swprintf_s(targetFile, L"%s_host_handoff_target_%04X.bin", label, offset);
+            CaptureStableWindow(reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(value)),
+                                0x200, dir + L"\\" + targetFile, L"boot17_host_handoff_target");
+        }
+    }
+
     for (DWORD offset : {0x680u, 0x700u}) {
         std::uint64_t value = 0;
         if (ReadMemory(root + offset, &value, sizeof(value)))
@@ -1012,9 +1119,11 @@ void CaptureTransitionHostSnapshot(const BYTE* image, SIZE_T imageSize,
         const BYTE* component = reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(componentValue));
         SIZE_T requested = 0x400;
         const unsigned selectorOffset = logicalOffsets[i];
-        if (selectorOffset == 0x03u || selectorOffset == 0x11u || selectorOffset == 0x30u)
-            requested = 0x1800;
-        else if (selectorOffset == 0x06u || selectorOffset == 0x1Cu || selectorOffset == 0x23u ||
+        if (selectorOffset == 0x11u)
+            requested = 0x3400; // Includes the Host+0x938 target at component+0x3198.
+        else if (selectorOffset == 0x03u || selectorOffset == 0x30u || selectorOffset == 0x1Cu)
+            requested = 0x1800; // Includes the Host+0x638 target at component+0x1518.
+        else if (selectorOffset == 0x06u || selectorOffset == 0x23u ||
                  selectorOffset == 0x04u || selectorOffset == 0x0Bu || selectorOffset == 0x20u ||
                  selectorOffset == 0x41u || selectorOffset == 0x44u)
             requested = 0x800;
@@ -1033,8 +1142,18 @@ void CaptureTransitionHostSnapshot(const BYTE* image, SIZE_T imageSize,
 
         if (selectorOffset == 0x03u)
             CaptureInteriorReference15(image, imageSize, component, 0xF30, logicalLabel, dir);
-        if (selectorOffset == 0x11u)
+        if (selectorOffset == 0x11u) {
             CaptureInteriorReference15(image, imageSize, component, 0x1258, logicalLabel, dir);
+            CaptureInteriorReference15(image, imageSize, component, 0x3198, logicalLabel, dir);
+        }
+        if (selectorOffset == 0x1Cu)
+            CaptureInteriorReference15(image, imageSize, component, 0x1518, logicalLabel, dir);
+
+        if (selectorOffset == 0x03u || selectorOffset == 0x11u ||
+            selectorOffset == 0x1Cu || selectorOffset == 0x22u ||
+            selectorOffset == 0x06u || selectorOffset == 0x41u) {
+            CaptureComponentRtti17(image, imageSize, component, logicalLabel, dir);
+        }
     }
 
     Log(L"BOOT16_CAPTURE_SUMMARY: state=%s table_entries=%u selected_components=%llu code_functions=%llu",
@@ -1278,6 +1397,7 @@ std::wstring RunCapture() {
     if (dir.empty()) return L"";
     Log(L"BOOT16_CAPTURE_DIRECTORY: %s", dir.c_str());
     CaptureBootstrap16CodeTargets(image, nt.OptionalHeader.SizeOfImage, nt, dir);
+    CaptureBootstrap17CodeTargets(image, nt.OptionalHeader.SizeOfImage, nt, dir);
     CaptureTransitionHostSnapshot(image, nt.OptionalHeader.SizeOfImage, nt,
                                   L"01_FREEDRIVE_VEHICLE", dir);
     return dir;
@@ -1285,10 +1405,10 @@ std::wstring RunCapture() {
 DWORD WINAPI Worker(LPVOID) {
     wchar_t exe[MAX_PATH]{};
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
-    Log(L"=== TC2 Walkmod diagnostic bootstrap 16 (targeted HQ Leave handoff) ===");
-    Log(L"BOOTSTRAP_VERSION: 16");
+    Log(L"=== TC2 Walkmod diagnostic bootstrap 17 (semantic target capture) ===");
+    Log(L"BOOTSTRAP_VERSION: 17");
     Log(L"PROBE_MODE: read-only; no hooks; no code patches; no game-memory writes; no game functions invoked");
-    Log(L"BOOT16_SCOPE: Host+0x2480/+0x1ED0/+0x1EF8; state callbacks; selector bytes 0x80; selected components");
+    Log(L"BOOT17_SCOPE: transform getter/callee; Host+0x638/+0x938 handoff targets; selected component RTTI and interior records");
     Log(L"TEST_SCENARIOS: F10 Freedrive vehicle; F11 HQ pedestrian before Leave; F12 after native HQ Leave");
     Log(L"IMPORTANT: trigger Leave manually in-game between F11 and F12; DLL never calls Leave");
     Log(L"EXCLUDED: no attempt to leave a Freedrive vehicle; no forced spawn or teleport");
@@ -1328,7 +1448,7 @@ DWORD WINAPI Worker(LPVOID) {
     }
     CaptureTransitionHostSnapshot(image, nt.OptionalHeader.SizeOfImage, nt,
                                   L"03_AFTER_HQ_LEAVE", dir);
-    Log(L"BOOTSTRAP16_SEQUENCE_COMPLETE: directory=%s", dir.c_str());
+    Log(L"BOOTSTRAP17_SEQUENCE_COMPLETE: directory=%s", dir.c_str());
     return 0;
 }
 bool LoadOriginal() {
