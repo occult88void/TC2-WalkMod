@@ -765,8 +765,6 @@ void CaptureHostWrapperDepth16(const BYTE* image, SIZE_T imageSize, const IMAGE_
     }
 }
 
-void CaptureInteriorReference15
-
 void CaptureInteriorReference15(const BYTE* image, SIZE_T imageSize, const BYTE* owner,
                                 SIZE_T offset, const wchar_t* label, const std::wstring& dir) {
     wchar_t fieldFile[192]{};
