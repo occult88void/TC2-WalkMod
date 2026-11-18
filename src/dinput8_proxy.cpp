@@ -444,7 +444,7 @@ bool CaptureObjectAndVtable(const BYTE* image, SIZE_T imageSize,
                             std::vector<std::uint64_t>& capturedObjects,
                             std::vector<std::uint64_t>& capturedFunctions) {
     if (!PlausiblePointer(image, imageSize, objectValue)) {
-        Log(L"BOOT14_OBJECT_SKIP: label=%s value=%016llX reason=not_plausible_external_pointer",
+        Log(L"BOOT15_OBJECT_SKIP: label=%s value=%016llX reason=not_plausible_external_pointer",
             label, static_cast<unsigned long long>(objectValue));
         return false;
     }
@@ -527,77 +527,329 @@ bool CaptureObjectAndVtable(const BYTE* image, SIZE_T imageSize,
     return objectOk;
 }
 
+
+bool CaptureStableWindow(const BYTE* address, SIZE_T requested,
+                         const std::wstring& path, const wchar_t* tag) {
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!address || VirtualQuery(address, &mbi, sizeof(mbi)) != sizeof(mbi) ||
+        mbi.State != MEM_COMMIT || !Readable(mbi.Protect)) {
+        Log(L"BOOT15_STABLE_SKIP: tag=%s address=%p reason=not_readable", tag, address);
+        return false;
+    }
+    const BYTE* end = static_cast<const BYTE*>(mbi.BaseAddress) + mbi.RegionSize;
+    if (end <= address) return false;
+    const SIZE_T size = (std::min)(requested, static_cast<SIZE_T>(end - address));
+    if (size < 8) {
+        Log(L"BOOT15_STABLE_SKIP: tag=%s address=%p reason=short_region size=0x%llX",
+            tag, address, static_cast<unsigned long long>(size));
+        return false;
+    }
+    std::vector<BYTE> first(size), second(size);
+    bool stable = false;
+    for (unsigned attempt = 1; attempt <= 3; ++attempt) {
+        if (!ReadMemory(address, first.data(), size) ||
+            !ReadMemory(address, second.data(), size)) {
+            Log(L"BOOT15_STABLE_READ_ERROR: tag=%s attempt=%u error=%lu",
+                tag, attempt, GetLastError());
+            continue;
+        }
+        if (memcmp(first.data(), second.data(), size) == 0) {
+            stable = true;
+            break;
+        }
+        Log(L"BOOT15_STABLE_CHANGED: tag=%s attempt=%u size=0x%llX",
+            tag, attempt, static_cast<unsigned long long>(size));
+        Sleep(10);
+    }
+    if (!stable) {
+        Log(L"BOOT15_STABLE_UNCONFIRMED: tag=%s address=%p size=0x%llX",
+            tag, address, static_cast<unsigned long long>(size));
+        return false;
+    }
+    if (!WriteFileBytes(path, first.data(), first.size())) return false;
+    std::uint64_t q0 = 0, q1 = 0;
+    memcpy(&q0, first.data(), 8);
+    if (first.size() >= 16) memcpy(&q1, first.data() + 8, 8);
+    Log(L"BOOT15_STABLE_OK: tag=%s address=%p size=0x%llX qword0=%016llX qword1=%016llX file=%s",
+        tag, address, static_cast<unsigned long long>(size),
+        static_cast<unsigned long long>(q0), static_cast<unsigned long long>(q1),
+        path.c_str());
+    return true;
+}
+
+bool CaptureCodeRva15(const BYTE* image, SIZE_T imageSize, const IMAGE_NT_HEADERS64& nt,
+                      DWORD rva, SIZE_T size, const wchar_t* label,
+                      const std::wstring& dir) {
+    if (rva >= imageSize || size > imageSize - rva ||
+        !IsExecutableRange(image, nt, rva, size)) {
+        Log(L"BOOT15_CODE_SKIP: label=%s rva=0x%08X size=0x%llX reason=not_executable_or_outside_image",
+            label, rva, static_cast<unsigned long long>(size));
+        return false;
+    }
+    wchar_t file[192]{};
+    swprintf_s(file, L"%s_rva_%08X.bin", label, rva);
+    return CaptureStableWindow(image + rva, size, dir + L"\\" + file, L"boot15_code");
+}
+
+void CaptureVtableDepth15(const BYTE* image, SIZE_T imageSize, const IMAGE_NT_HEADERS64& nt,
+                          std::uint64_t vtableValue, const wchar_t* label,
+                          const std::wstring& dir,
+                          std::vector<std::uint64_t>& capturedFunctions) {
+    if (!IsCanonicalAlignedPointer(vtableValue)) {
+        Log(L"BOOT15_TRUE_VTABLE_SKIP: label=%s value=%016llX reason=not_canonical_aligned",
+            label, static_cast<unsigned long long>(vtableValue));
+        return;
+    }
+    const BYTE* vtable = reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(vtableValue));
+    std::uint64_t entries[32]{};
+    SIZE_T count = 32;
+    if (!ReadMemory(vtable, entries, sizeof(entries))) {
+        count = 16;
+        if (!ReadMemory(vtable, entries, count * sizeof(std::uint64_t))) {
+            Log(L"BOOT15_TRUE_VTABLE_READ_ERROR: label=%s address=%p", label, vtable);
+            return;
+        }
+    }
+    wchar_t file[192]{};
+    swprintf_s(file, L"%s_true_vtable_%02llu.bin", label, static_cast<unsigned long long>(count));
+    CaptureStableWindow(vtable, count * sizeof(std::uint64_t),
+                        dir + L"\\" + file, L"boot15_true_vtable");
+    Log(L"BOOT15_TRUE_VTABLE: label=%s address=%p entries=%llu file=%s",
+        label, vtable, static_cast<unsigned long long>(count), file);
+    const std::uint64_t base = reinterpret_cast<std::uint64_t>(image);
+    for (SIZE_T i = 0; i < count; ++i) {
+        const std::uint64_t target = entries[i];
+        if (!target || target < base || target - base >= imageSize) continue;
+        const DWORD rva = static_cast<DWORD>(target - base);
+        if (!IsExecutableRange(image, nt, rva, 0x40)) continue;
+        if (std::find(capturedFunctions.begin(), capturedFunctions.end(), target) != capturedFunctions.end())
+            continue;
+        capturedFunctions.push_back(target);
+        wchar_t codeLabel[192]{};
+        swprintf_s(codeLabel, L"%s_vslot_%02llu", label, static_cast<unsigned long long>(i));
+        wchar_t codeFile[224]{};
+        swprintf_s(codeFile, L"%s_vslot_%02llu_rva_%08X.bin",
+                   label, static_cast<unsigned long long>(i), rva);
+        CaptureStableWindow(image + rva, 0x100, dir + L"\\" + codeFile, L"boot15_vtable_code");
+        Log(L"BOOT15_TRUE_VTABLE_FUNCTION: label=%s slot=%llu rva=0x%08X file=%s",
+            codeLabel, static_cast<unsigned long long>(i), rva, codeFile);
+    }
+}
+
+void CaptureCodePointerFields15(const BYTE* image, SIZE_T imageSize, const IMAGE_NT_HEADERS64& nt,
+                                const BYTE* object, SIZE_T requested, const wchar_t* label,
+                                const std::wstring& dir,
+                                std::vector<std::uint64_t>& capturedFunctions) {
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!object || VirtualQuery(object, &mbi, sizeof(mbi)) != sizeof(mbi) ||
+        mbi.State != MEM_COMMIT || !Readable(mbi.Protect)) return;
+    const BYTE* end = static_cast<const BYTE*>(mbi.BaseAddress) + mbi.RegionSize;
+    if (end <= object) return;
+    const SIZE_T size = (std::min)(requested, static_cast<SIZE_T>(end - object));
+    if (size < 8) return;
+    std::vector<BYTE> bytes(size);
+    if (!ReadMemory(object, bytes.data(), size)) return;
+    const std::uint64_t base = reinterpret_cast<std::uint64_t>(image);
+    for (SIZE_T off = 0; off + 8 <= size; off += 8) {
+        std::uint64_t value = 0;
+        memcpy(&value, bytes.data() + off, 8);
+        if (value < base || value - base >= imageSize) continue;
+        const DWORD rva = static_cast<DWORD>(value - base);
+        if (!IsExecutableRange(image, nt, rva, 0x40)) continue;
+        if (std::find(capturedFunctions.begin(), capturedFunctions.end(), value) != capturedFunctions.end())
+            continue;
+        capturedFunctions.push_back(value);
+        wchar_t file[224]{};
+        swprintf_s(file, L"%s_field_%04llX_code_rva_%08X.bin",
+                   label, static_cast<unsigned long long>(off), rva);
+        CaptureStableWindow(image + rva, 0x100, dir + L"\\" + file, L"boot15_object_code_pointer");
+        Log(L"BOOT15_CODE_POINTER_FIELD: label=%s byte_offset=0x%llX rva=0x%08X file=%s",
+            label, static_cast<unsigned long long>(off), rva, file);
+    }
+}
+
+void CaptureHostWrapperDepth15(const BYTE* image, SIZE_T imageSize, const IMAGE_NT_HEADERS64& nt,
+                               const BYTE* root, DWORD offset, const wchar_t* state,
+                               const std::wstring& dir,
+                               std::vector<std::uint64_t>& capturedFunctions) {
+    std::uint64_t wrapperValue = 0;
+    if (!ReadMemory(root + offset, &wrapperValue, sizeof(wrapperValue)) ||
+        !PlausiblePointer(image, imageSize, wrapperValue)) {
+        Log(L"BOOT15_WRAPPER_SKIP: state=%s offset=0x%X value=%016llX",
+            state, offset, static_cast<unsigned long long>(wrapperValue));
+        return;
+    }
+    const BYTE* wrapper = reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(wrapperValue));
+    wchar_t label[128]{};
+    swprintf_s(label, L"%s_host_%04X", state, offset);
+    wchar_t file[192]{};
+    swprintf_s(file, L"%s_wrapper.bin", label);
+    CaptureStableWindow(wrapper, 0x200, dir + L"\\" + file, L"boot15_wrapper");
+    CaptureCodePointerFields15(image, imageSize, nt, wrapper, 0x200, label, dir, capturedFunctions);
+
+    std::uint64_t nestedValue = 0;
+    if (!ReadMemory(wrapper, &nestedValue, sizeof(nestedValue)) ||
+        !PlausiblePointer(image, imageSize, nestedValue)) {
+        Log(L"BOOT15_WRAPPER_NESTED_SKIP: label=%s wrapper=%p first_qword=%016llX",
+            label, wrapper, static_cast<unsigned long long>(nestedValue));
+        return;
+    }
+    const BYTE* nested = reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(nestedValue));
+    wchar_t nestedLabel[160]{};
+    swprintf_s(nestedLabel, L"%s_nested", label);
+    swprintf_s(file, L"%s_nested_object.bin", label);
+    CaptureStableWindow(nested, 0x800, dir + L"\\" + file, L"boot15_nested_object");
+    CaptureCodePointerFields15(image, imageSize, nt, nested, 0x800, nestedLabel, dir, capturedFunctions);
+
+    std::uint64_t trueVtable = 0;
+    if (ReadMemory(nested, &trueVtable, sizeof(trueVtable))) {
+        Log(L"BOOT15_POINTER_DEPTH: state=%s host_offset=0x%X wrapper=%p nested=%p true_vtable=%016llX",
+            state, offset, wrapper, nested, static_cast<unsigned long long>(trueVtable));
+        wchar_t vtableLabel[160]{};
+        swprintf_s(vtableLabel, L"%s_nested", label);
+        CaptureVtableDepth15(image, imageSize, nt, trueVtable, vtableLabel, dir, capturedFunctions);
+    }
+}
+
+void CaptureInteriorReference15(const BYTE* image, SIZE_T imageSize, const BYTE* owner,
+                                SIZE_T offset, const wchar_t* label, const std::wstring& dir) {
+    std::uint64_t value = 0;
+    if (!ReadMemory(owner + offset, &value, sizeof(value))) {
+        Log(L"BOOT15_INTERIOR_REF_SKIP: label=%s offset=0x%llX reason=unreadable",
+            label, static_cast<unsigned long long>(offset));
+        return;
+    }
+    Log(L"BOOT15_INTERIOR_REF: label=%s offset=0x%llX value=%016llX",
+        label, static_cast<unsigned long long>(offset), static_cast<unsigned long long>(value));
+    if (!PlausiblePointer(image, imageSize, value)) return;
+    wchar_t file[192]{};
+    swprintf_s(file, L"%s_ref_%04llX.bin", label, static_cast<unsigned long long>(offset));
+    CaptureStableWindow(reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(value)),
+                        0x200, dir + L"\\" + file, L"boot15_interior_reference");
+}
+
+void CaptureBootstrap15CodeTargets(const BYTE* image, SIZE_T imageSize,
+                                   const IMAGE_NT_HEADERS64& nt, const std::wstring& dir) {
+    const CodeTarget targets[] = {
+        {L"host_6d0_vehicle_pointer_b2ff30", 0x00B2FF30u, 0x180},
+        {L"host_6d0_vehicle_cleanup_b2ff50", 0x00B2FF50u, 0x180},
+        {L"host_6d0_vehicle_pointer_b2faa0", 0x00B2FAA0u, 0x180},
+        {L"host_6d0_vehicle_thunk_b2f430", 0x00B2F430u, 0x100},
+        {L"host_6d0_thunk_b77fa0", 0x00B77FA0u, 0x100},
+        {L"host_6d0_thunk_b78010", 0x00B78010u, 0x100},
+        {L"host_6d0_thunk_b948e0", 0x00B948E0u, 0x100},
+        {L"host_6d0_thunk_b78150", 0x00B78150u, 0x100},
+        {L"host_6d0_thunk_b786a0", 0x00B786A0u, 0x100},
+        {L"host_6d0_thunk_b78710", 0x00B78710u, 0x100},
+        {L"host_6d0_thunk_b96590", 0x00B96590u, 0x100},
+        {L"host_6d0_hq_thunk_e63e40", 0x00E63E40u, 0x100},
+        {L"host_6d0_hq_target_eccee0", 0x00ECCEE0u, 0x180}
+    };
+    unsigned captured = 0, skipped = 0;
+    for (const auto& target : targets) {
+        if (CaptureCodeRva15(image, imageSize, nt, target.rva, target.size, target.name, dir))
+            ++captured;
+        else
+            ++skipped;
+    }
+    Log(L"BOOT15_CODE_TARGET_SUMMARY: targets=%llu captured=%u skipped=%u",
+        static_cast<unsigned long long>(_countof(targets)), captured, skipped);
+}
+
 void CaptureTransitionHostSnapshot(const BYTE* image, SIZE_T imageSize,
                                    const IMAGE_NT_HEADERS64& nt,
                                    const wchar_t* label, const std::wstring& dir) {
     constexpr DWORD kGlobalPointerRva = 0x0343C630u;
-    const DWORD hostObjectOffsets[] = {0x650u, 0x658u, 0x6D0u, 0x6D8u, 0x1E68u};
-    const DWORD scalarOffsets[] = {0x680u, 0x700u};
-    Log(L"=== BOOTSTRAP14 HOST + COMPONENT TABLE SNAPSHOT BEGIN state=%s (read-only) ===", label);
+    constexpr DWORD wrapperOffsets[] = {0x650u, 0x658u, 0x6D0u, 0x6D8u};
+    constexpr DWORD directObjectOffsets[] = {0x1E68u};
+    constexpr DWORD stateReferenceOffsets[] = {0x538u, 0x548u, 0x5B8u, 0x5C8u};
+    constexpr DWORD hostTailOffsets[] = {0x2BC8u, 0x2C08u, 0x2D08u};
+    Log(L"=== BOOTSTRAP15 HOST + SPAWN BRIDGE SNAPSHOT BEGIN state=%s (read-only) ===", label);
     if (kGlobalPointerRva > imageSize || sizeof(std::uint64_t) > imageSize - kGlobalPointerRva) {
-        Log(L"BOOT14_HOST_ABORT: state=%s reason=global_slot_outside_image", label);
+        Log(L"BOOT15_HOST_ABORT: state=%s reason=global_slot_outside_image", label);
         return;
     }
-
     std::uint64_t host = 0;
     if (!ReadMemory(image + kGlobalPointerRva, &host, sizeof(host)) ||
         !PlausiblePointer(image, imageSize, host)) {
-        Log(L"BOOT14_HOST_ABORT: state=%s reason=invalid_host_pointer value=%016llX",
+        Log(L"BOOT15_HOST_ABORT: state=%s reason=invalid_host_pointer value=%016llX",
             label, static_cast<unsigned long long>(host));
         return;
     }
     const BYTE* root = reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(host));
-    Log(L"BOOT14_HOST: state=%s host=%p", label, root);
+    Log(L"BOOT15_HOST: state=%s host=%p", label, root);
     wchar_t rootFile[128]{};
-    swprintf_s(rootFile, L"%s_component_host_root_0x2000.bin", label);
-    CaptureWindow(root, 0x2000, dir + L"\\" + rootFile, L"boot14_component_host_root");
+    swprintf_s(rootFile, L"%s_host_root_0x4000.bin", label);
+    CaptureStableWindow(root, 0x4000, dir + L"\\" + rootFile, L"boot15_host_root");
 
-    std::vector<std::uint64_t> capturedObjects;
     std::vector<std::uint64_t> capturedFunctions;
-    for (DWORD offset : hostObjectOffsets) {
+    for (DWORD offset : wrapperOffsets)
+        CaptureHostWrapperDepth15(image, imageSize, nt, root, offset, label, dir, capturedFunctions);
+
+    for (DWORD offset : directObjectOffsets) {
         std::uint64_t value = 0;
-        if (!ReadMemory(root + offset, &value, sizeof(value))) {
-            Log(L"BOOT14_HOST_FIELD_SKIP: state=%s offset=0x%X reason=read_failed error=%lu",
-                label, offset, GetLastError());
-            continue;
-        }
-        Log(L"BOOT14_HOST_POINTER: state=%s offset=0x%X value=%016llX",
+        if (!ReadMemory(root + offset, &value, sizeof(value))) continue;
+        Log(L"BOOT15_HOST_DIRECT_OBJECT: state=%s offset=0x%X value=%016llX",
             label, offset, static_cast<unsigned long long>(value));
         wchar_t objectLabel[128]{};
         swprintf_s(objectLabel, L"%s_host_field_%04X", label, offset);
         CaptureObjectAndVtable(image, imageSize, nt, value, objectLabel, dir,
-                               capturedObjects, capturedFunctions);
+                               *new std::vector<std::uint64_t>(), capturedFunctions);
     }
 
-    for (DWORD offset : scalarOffsets) {
+    for (DWORD offset : stateReferenceOffsets) {
         std::uint64_t value = 0;
-        if (ReadMemory(root + offset, &value, sizeof(value))) {
-            Log(L"BOOT14_HOST_SCALAR: state=%s offset=0x%X value=%016llX",
-                label, offset, static_cast<unsigned long long>(value));
+        if (!ReadMemory(root + offset, &value, sizeof(value))) continue;
+        Log(L"BOOT15_HOST_STATE_REFERENCE: state=%s offset=0x%X value=%016llX",
+            label, offset, static_cast<unsigned long long>(value));
+        if (PlausiblePointer(image, imageSize, value)) {
+            wchar_t file[128]{};
+            swprintf_s(file, L"%s_host_state_ref_%04X.bin", label, offset);
+            CaptureStableWindow(reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(value)),
+                                0x200, dir + L"\\" + file, L"boot15_host_state_reference");
         }
     }
 
-    // Snapshot the component table and selector before resolving any indices.
+    for (DWORD offset : hostTailOffsets) {
+        std::uint64_t value = 0;
+        if (!ReadMemory(root + offset, &value, sizeof(value))) continue;
+        Log(L"BOOT15_HOST_TAIL_FIELD: state=%s offset=0x%X address=%p qword=%016llX",
+            label, offset, root + offset, static_cast<unsigned long long>(value));
+        wchar_t file[128]{};
+        swprintf_s(file, L"%s_host_tail_%04X.bin", label, offset);
+        CaptureStableWindow(root + offset, 0x100, dir + L"\\" + file, L"boot15_host_tail_field");
+        if (PlausiblePointer(image, imageSize, value)) {
+            wchar_t targetFile[128]{};
+            swprintf_s(targetFile, L"%s_host_tail_target_%04X.bin", label, offset);
+            CaptureStableWindow(reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(value)),
+                                0x200, dir + L"\\" + targetFile, L"boot15_host_tail_target");
+        }
+    }
+
+    for (DWORD offset : {0x680u, 0x700u}) {
+        std::uint64_t value = 0;
+        if (ReadMemory(root + offset, &value, sizeof(value)))
+            Log(L"BOOT15_HOST_SCALAR: state=%s offset=0x%X value=%016llX",
+                label, offset, static_cast<unsigned long long>(value));
+    }
+
     std::uint64_t tableValue = 0, tableMeta = 0, selectorValue = 0, selectorMeta = 0;
     if (!ReadMemory(root + 0x1DD8, &tableValue, sizeof(tableValue)) ||
         !ReadMemory(root + 0x1DE0, &tableMeta, sizeof(tableMeta)) ||
         !ReadMemory(root + 0x1DE8, &selectorValue, sizeof(selectorValue)) ||
         !ReadMemory(root + 0x1DF0, &selectorMeta, sizeof(selectorMeta))) {
-        Log(L"BOOT14_TABLE_ABORT: state=%s reason=host_table_fields_unreadable", label);
-        Log(L"=== BOOTSTRAP14 HOST + COMPONENT TABLE SNAPSHOT END state=%s ===", label);
+        Log(L"BOOT15_TABLE_ABORT: state=%s reason=host_table_fields_unreadable", label);
         return;
     }
     const std::uint32_t count = static_cast<std::uint32_t>(tableMeta & 0xFFFFFFFFu);
-    Log(L"BOOT14_TABLE_FIELDS: state=%s table=%016llX table_meta=%016llX count=%u selector=%016llX selector_meta=%016llX",
+    Log(L"BOOT15_TABLE_FIELDS: state=%s table=%016llX table_meta=%016llX count=%u selector=%016llX selector_meta=%016llX",
         label, static_cast<unsigned long long>(tableValue),
         static_cast<unsigned long long>(tableMeta), count,
         static_cast<unsigned long long>(selectorValue),
         static_cast<unsigned long long>(selectorMeta));
     if (!PlausiblePointer(image, imageSize, tableValue) ||
-        !PlausiblePointer(image, imageSize, selectorValue) ||
-        count < 0x24u || count > 128u) {
-        Log(L"BOOT14_TABLE_ABORT: state=%s reason=invalid_table_selector_or_count", label);
-        Log(L"=== BOOTSTRAP14 HOST + COMPONENT TABLE SNAPSHOT END state=%s ===", label);
+        !PlausiblePointer(image, imageSize, selectorValue) || count < 0x24u || count > 128u) {
+        Log(L"BOOT15_TABLE_ABORT: state=%s reason=invalid_table_selector_or_count", label);
         return;
     }
 
@@ -614,23 +866,22 @@ void CaptureTransitionHostSnapshot(const BYTE* image, SIZE_T imageSize,
                         selectorSnapshot.data(), selectorSnapshot.size()) ||
             !ReadMemory(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(selectorValue)),
                         selectorVerify.data(), selectorVerify.size())) {
-            Log(L"BOOT14_TABLE_READ_ERROR: state=%s attempt=%u error=%lu", label, attempt, GetLastError());
+            Log(L"BOOT15_TABLE_READ_ERROR: state=%s attempt=%u error=%lu", label, attempt, GetLastError());
             continue;
         }
         if (memcmp(tableSnapshot.data(), tableVerify.data(), tableBytes) == 0 &&
             memcmp(selectorSnapshot.data(), selectorVerify.data(), selectorSnapshot.size()) == 0) {
             stable = true;
-            Log(L"BOOT14_TABLE_STABLE: state=%s attempt=%u table_bytes=0x%llX selector_bytes=0x%llX",
+            Log(L"BOOT15_TABLE_STABLE: state=%s attempt=%u table_bytes=0x%llX selector_bytes=0x%llX",
                 label, attempt, static_cast<unsigned long long>(tableBytes),
                 static_cast<unsigned long long>(selectorSnapshot.size()));
             break;
         }
-        Log(L"BOOT14_TABLE_CHANGED_DURING_SNAPSHOT: state=%s attempt=%u", label, attempt);
+        Log(L"BOOT15_TABLE_CHANGED_DURING_SNAPSHOT: state=%s attempt=%u", label, attempt);
         Sleep(20);
     }
     if (!stable) {
-        Log(L"BOOT14_TABLE_ABORT: state=%s reason=table_or_selector_not_stable", label);
-        Log(L"=== BOOTSTRAP14 HOST + COMPONENT TABLE SNAPSHOT END state=%s ===", label);
+        Log(L"BOOT15_TABLE_ABORT: state=%s reason=table_or_selector_not_stable", label);
         return;
     }
 
@@ -639,60 +890,89 @@ void CaptureTransitionHostSnapshot(const BYTE* image, SIZE_T imageSize,
     swprintf_s(selectorFile, L"%s_component_selector_0x40.bin", label);
     WriteFileBytes(dir + L"\\" + tableFile, tableSnapshot.data(), tableSnapshot.size());
     WriteFileBytes(dir + L"\\" + selectorFile, selectorSnapshot.data(), selectorSnapshot.size());
-    Log(L"BOOT14_TABLE_SNAPSHOT_OK: state=%s table_file=%s selector_file=%s",
-        label, tableFile, selectorFile);
 
-    const unsigned selectorOffsets[] = {0x02u, 0x03u, 0x04u, 0x23u};
-    unsigned selectedIndices[4]{};
-    for (unsigned i = 0; i < _countof(selectorOffsets); ++i) {
-        selectedIndices[i] = selectorSnapshot[selectorOffsets[i]];
-        Log(L"BOOT14_SELECTOR_ENTRY: state=%s selector_offset=0x%02X table_index=0x%02X decimal=%u",
-            label, selectorOffsets[i], selectedIndices[i], selectedIndices[i]);
+    constexpr unsigned logicalOffsets[] = {0x03u, 0x11u, 0x06u, 0x1Cu, 0x23u, 0x25u,
+                                            0x1Au, 0x1Du, 0x22u, 0x20u, 0x08u};
+    std::uint64_t logicalObjects[_countof(logicalOffsets)]{};
+    unsigned logicalIndices[_countof(logicalOffsets)]{};
+    for (unsigned i = 0; i < _countof(logicalOffsets); ++i) {
+        logicalIndices[i] = selectorSnapshot[logicalOffsets[i]];
+        if (logicalIndices[i] < count)
+            memcpy(&logicalObjects[i], tableSnapshot.data() + static_cast<SIZE_T>(logicalIndices[i]) * 8, 8);
+        Log(L"BOOT15_LOGICAL_COMPONENT: state=%s selector_offset=0x%02X table_index=0x%02X object=%016llX",
+            label, logicalOffsets[i], logicalIndices[i],
+            static_cast<unsigned long long>(logicalObjects[i]));
     }
 
-    std::uint64_t selected03Object = 0;
+    std::vector<std::uint64_t> capturedObjects;
     for (unsigned index = 0; index < count; ++index) {
         std::uint64_t component = 0;
         memcpy(&component, tableSnapshot.data() + static_cast<SIZE_T>(index) * 8, 8);
-        if (!PlausiblePointer(image, imageSize, component)) {
-            Log(L"BOOT14_TABLE_ENTRY_SKIP: state=%s index=0x%02X value=%016llX reason=null_or_nonpointer",
-                label, index, static_cast<unsigned long long>(component));
-            continue;
-        }
-        bool isSelected = false;
-        for (unsigned selected : selectedIndices) if (selected == index) isSelected = true;
-        if (index == selectedIndices[1]) selected03Object = component;
+        if (!PlausiblePointer(image, imageSize, component)) continue;
         wchar_t objectLabel[128]{};
         swprintf_s(objectLabel, L"%s_component_%03u", label, index);
-        Log(L"BOOT14_TABLE_ENTRY: state=%s index=0x%02X object=%016llX selected=%u",
-            label, index, static_cast<unsigned long long>(component), isSelected ? 1u : 0u);
         CaptureObjectAndVtable(image, imageSize, nt, component, objectLabel, dir,
                                capturedObjects, capturedFunctions);
     }
 
-    // The lifecycle helper also dereferences component[selected(+0x03)] + 0xDF8.
-    if (selected03Object) {
-        std::uint64_t nestedValue = 0;
-        const BYTE* selectedObject = reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(selected03Object));
-        if (ReadMemory(selectedObject + 0xDF8, &nestedValue, sizeof(nestedValue))) {
-            Log(L"BOOT14_SELECTED_03_FIELD_DF8: state=%s component=%p value=%016llX",
-                label, selectedObject, static_cast<unsigned long long>(nestedValue));
-            wchar_t nestedLabel[128]{};
-            swprintf_s(nestedLabel, L"%s_selector_03_field_DF8", label);
-            CaptureObjectAndVtable(image, imageSize, nt, nestedValue, nestedLabel, dir,
-                                   capturedObjects, capturedFunctions);
-        } else {
-            Log(L"BOOT14_SELECTED_03_FIELD_DF8_SKIP: state=%s component=%p reason=unreadable",
-                label, selectedObject);
+    for (unsigned i = 0; i < _countof(logicalOffsets); ++i) {
+        const std::uint64_t componentValue = logicalObjects[i];
+        if (!PlausiblePointer(image, imageSize, componentValue)) continue;
+        const BYTE* component = reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(componentValue));
+        SIZE_T requested = 0x400;
+        if (logicalOffsets[i] == 0x03u || logicalOffsets[i] == 0x11u) requested = 0x1800;
+        else if (logicalOffsets[i] == 0x06u || logicalOffsets[i] == 0x1Cu ||
+                 logicalOffsets[i] == 0x23u) requested = 0x800;
+        wchar_t logicalLabel[128]{};
+        swprintf_s(logicalLabel, L"%s_logical_%02X", label, logicalOffsets[i]);
+        wchar_t file[192]{};
+        swprintf_s(file, L"%s_component_extended_0x%llX.bin",
+                   logicalLabel, static_cast<unsigned long long>(requested));
+        CaptureStableWindow(component, requested, dir + L"\\" + file, L"boot15_logical_component");
+
+        if (logicalOffsets[i] == 0x03u) {
+            CaptureInteriorReference15(image, imageSize, component, 0xF30, logicalLabel, dir);
+            std::uint64_t descriptorValue = 0;
+            if (ReadMemory(component + 0xDF8, &descriptorValue, sizeof(descriptorValue)) &&
+                PlausiblePointer(image, imageSize, descriptorValue)) {
+                const BYTE* descriptor = reinterpret_cast<const BYTE*>(static_cast<std::uintptr_t>(descriptorValue));
+                wchar_t descriptorLabel[128]{};
+                swprintf_s(descriptorLabel, L"%s_selector03_DF8_descriptor", label);
+                swprintf_s(file, L"%s_wrapper.bin", descriptorLabel);
+                CaptureStableWindow(descriptor, 0x240, dir + L"\\" + file, L"boot15_descriptor_wrapper");
+                CaptureCodePointerFields15(image, imageSize, nt, descriptor, 0x240,
+                                            descriptorLabel, dir, capturedFunctions);
+                for (SIZE_T off : {static_cast<SIZE_T>(0x98), static_cast<SIZE_T>(0xA8)})
+                    CaptureInteriorReference15(image, imageSize, descriptor, off, descriptorLabel, dir);
+                for (SIZE_T off : {static_cast<SIZE_T>(0x18), static_cast<SIZE_T>(0x48), static_cast<SIZE_T>(0x78)}) {
+                    std::uint64_t callback = 0;
+                    if (!ReadMemory(descriptor + off, &callback, sizeof(callback))) continue;
+                    const std::uint64_t base = reinterpret_cast<std::uint64_t>(image);
+                    if (callback < base || callback - base >= imageSize) continue;
+                    const DWORD rva = static_cast<DWORD>(callback - base);
+                    wchar_t callbackFile[160]{};
+                    swprintf_s(callbackFile, L"%s_callback_%03llX_rva_%08X.bin",
+                               descriptorLabel, static_cast<unsigned long long>(off), rva);
+                    CaptureStableWindow(image + rva, 0x100,
+                                        dir + L"\\" + callbackFile, L"boot15_descriptor_callback");
+                    Log(L"BOOT15_DESCRIPTOR_CALLBACK: state=%s offset=0x%llX rva=0x%08X",
+                        label, static_cast<unsigned long long>(off), rva);
+                }
+            } else {
+                Log(L"BOOT15_DESCRIPTOR_SKIP: state=%s selector03_component=%p field_DF8=%016llX",
+                    label, component, static_cast<unsigned long long>(descriptorValue));
+            }
         }
+        if (logicalOffsets[i] == 0x11u)
+            CaptureInteriorReference15(image, imageSize, component, 0x1258, logicalLabel, dir);
     }
 
-    Log(L"BOOT14_CAPTURE_SUMMARY: state=%s unique_objects=%llu unique_image_functions=%llu",
-        label, static_cast<unsigned long long>(capturedObjects.size()),
+    Log(L"BOOT15_CAPTURE_SUMMARY: state=%s table_entries=%u logical_components=%llu captured_objects=%llu code_functions=%llu",
+        label, count, static_cast<unsigned long long>(_countof(logicalOffsets)),
+        static_cast<unsigned long long>(capturedObjects.size()),
         static_cast<unsigned long long>(capturedFunctions.size()));
-    Log(L"=== BOOTSTRAP14 HOST + COMPONENT TABLE SNAPSHOT END state=%s ===", label);
+    Log(L"=== BOOTSTRAP15 HOST + SPAWN BRIDGE SNAPSHOT END state=%s ===", label);
 }
-
 void CaptureSlotVtableAndRtti(const BYTE* image, SIZE_T imageSize,
                               const BYTE* object, const wchar_t* label,
                               unsigned slot, const std::wstring& dir,
@@ -928,6 +1208,7 @@ std::wstring RunCapture() {
     if (dir.empty()) return L"";
     Log(L"BOOT13_CAPTURE_DIRECTORY: %s", dir.c_str());
     CaptureNativeCode(image, nt.OptionalHeader.SizeOfImage, nt, dir);
+    CaptureBootstrap15CodeTargets(image, nt.OptionalHeader.SizeOfImage, nt, dir);
     CaptureTransitionHostSnapshot(image, nt.OptionalHeader.SizeOfImage, nt,
                                   L"01_FREEDRIVE_VEHICLE", dir);
     return dir;}
@@ -935,9 +1216,10 @@ std::wstring RunCapture() {
 DWORD WINAPI Worker(LPVOID) {
     wchar_t exe[MAX_PATH]{};
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
-    Log(L"=== TC2 Walkmod diagnostic bootstrap 14 (Host, component table and actual vtables) ===");
-    Log(L"BOOTSTRAP_VERSION: 14");
+    Log(L"=== TC2 Walkmod diagnostic bootstrap 15 (Host pointer depth and spawn bridge) ===");
+    Log(L"BOOTSTRAP_VERSION: 15");
     Log(L"PROBE_MODE: read-only; no hooks; no code patches; no game-memory writes");
+    Log(L"BOOT15_SCOPE: Host wrapper->nested object->true vtable; logical components; spawn bridge references");
     Log(L"TEST_SCENARIOS: 01_FREEDRIVE_VEHICLE then 02_HQ_PEDESTRIAN only");
     Log(L"EXCLUDED: Leave action and open-world pedestrian scenario are not part of this capture");
     Log(L"Game executable: %s", exe);
@@ -947,7 +1229,7 @@ DWORD WINAPI Worker(LPVOID) {
     if (dir.empty()) return 0;
 
     if (!WaitForHotkey(VK_F11, L"02_HQ_PEDESTRIAN")) {
-        Log(L"BOOT14_SEQUENCE_INCOMPLETE: HQ snapshot was not triggered; directory=%s", dir.c_str());
+        Log(L"BOOT15_SEQUENCE_INCOMPLETE: HQ snapshot was not triggered; directory=%s", dir.c_str());
         return 0;
     }
     HMODULE module = GetModuleHandleW(nullptr);
@@ -964,12 +1246,12 @@ DWORD WINAPI Worker(LPVOID) {
         hqNt.Signature != IMAGE_NT_SIGNATURE ||
         hqNt.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
         hqNt.FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64) {
-        Log(L"BOOT14_HQ_ABORT: invalid main module headers");
+        Log(L"BOOT15_HQ_ABORT: invalid main module headers");
         return 0;
     }
     CaptureTransitionHostSnapshot(hqImage, hqNt.OptionalHeader.SizeOfImage, hqNt,
                                    L"02_HQ_PEDESTRIAN", dir);
-    Log(L"BOOTSTRAP14_SEQUENCE_COMPLETE: directory=%s",
+    Log(L"BOOTSTRAP15_SEQUENCE_COMPLETE: directory=%s",
         dir.c_str());
     return 0;
 }
