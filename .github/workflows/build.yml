@@ -4,7 +4,7 @@ name: Build TC2 Walkmod bootstrap
 on:
   workflow_dispatch:
   push:
-    branches: [ main, master, starter-06-safe-scan, starter-07-readable-sections, starter-08-referenced-object-capture, analysis-05-native-lifecycle-ver09, analysis-08-component-host-snapshot, analysis-14-bootstrap12-two-state, analysis-15-bootstrap13-lifecycle, analysis-16-bootstrap14-host-table ]
+    branches: [ main, master, starter-06-safe-scan, starter-07-readable-sections, starter-08-referenced-object-capture, analysis-05-native-lifecycle-ver09, analysis-08-component-host-snapshot, analysis-14-bootstrap12-two-state, analysis-15-bootstrap13-lifecycle, analysis-16-bootstrap14-host-table, analysis-17-bootstrap15-spawn-bridge ]
 
 jobs:
   build:
