@@ -3,6 +3,7 @@
 #include <dinput.h>
 #include <algorithm>
 #include <cstdint>
+#include <cstddef>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -1379,12 +1380,15 @@ void CaptureComponentHostSnapshot(const BYTE* image, SIZE_T imageSize,
     Log(L"=== BOOTSTRAP12 TWO-STATE SLOT CAPTURE END state=%s ===", label);
 }
 
+#include "factory_probe.inc"
+
 std::wstring RunCapture() {
     HMODULE module = GetModuleHandleW(nullptr);
     if (!module) { Log(L"BOOT16_ABORT: main module unavailable"); return L""; }
     const BYTE* image = reinterpret_cast<const BYTE*>(module);
     IMAGE_DOS_HEADER dos{};
-    if (!ReadMemory(image, &dos, sizeof(dos)) || dos.e_magic != IMAGE_DOS_SIGNATURE) {
+    if (!ReadMemory(image, &dos, sizeof(dos)) || dos.e_magic != IMAGE_DOS_SIGNATURE ||
+        dos.e_lfanew < 0 || static_cast<DWORD>(dos.e_lfanew) > kImageSize - sizeof(IMAGE_NT_HEADERS64)) {
         Log(L"BOOT16_ABORT: invalid DOS header"); return L"";
     }
     IMAGE_NT_HEADERS64 nt{};
@@ -1403,66 +1407,36 @@ std::wstring RunCapture() {
     std::wstring dir = NewCaptureDirectory();
     if (dir.empty()) return L"";
     Log(L"BOOT16_CAPTURE_DIRECTORY: %s", dir.c_str());
-    CaptureBootstrap16CodeTargets(image, nt.OptionalHeader.SizeOfImage, nt, dir);
-    CaptureBootstrap17CodeTargets(image, nt.OptionalHeader.SizeOfImage, nt, dir);
-    CaptureTransitionHostSnapshot(image, nt.OptionalHeader.SizeOfImage, nt,
-                                  L"01_FREEDRIVE_VEHICLE", dir);
+    CaptureFactoryReferences(image, nt.OptionalHeader.SizeOfImage, nt, dir);
+    // Each range is an unresolved direct callee from the supplied Bootstrap16
+    // windows. These are code reads, never calls to candidate game functions.
+    const CodeTarget targets[] = {
+        {L"handoff_reference_assignment", 0x004301E0u, 0x600},
+        {L"hq_entity_lookup", 0x00E79110u, 0x400},
+        {L"hq_entity_binding", 0x00E792D0u, 0x400},
+        {L"hq_entity_update", 0x00E79250u, 0x100},
+        {L"hq_context_update", 0x00ECB2B0u, 0x500},
+        {L"hq_context_tail", 0x00ECB710u, 0x500},
+        {L"interaction_update_a", 0x00B667C0u, 0x200},
+        {L"interaction_update_b", 0x00B66920u, 0x100},
+        {L"interaction_update_c", 0x00B66A20u, 0x300},
+        {L"transform_owner_lookup", 0x0119EBE0u, 0x300},
+        {L"transform_getter", 0x0119FC60u, 0x300}
+    };
+    for (const auto& target : targets) {
+        CaptureCodeRva15(image, nt.OptionalHeader.SizeOfImage, nt,
+                         target.rva, target.size, target.name, dir);
+    }
     return dir;
 }
 DWORD WINAPI Worker(LPVOID) {
-    wchar_t exe[MAX_PATH]{};
-    GetModuleFileNameW(nullptr, exe, MAX_PATH);
-    Log(L"=== TC2 Walkmod diagnostic bootstrap 17 (semantic target capture) ===");
-    Log(L"BOOTSTRAP_VERSION: 17");
-    Log(L"PROBE_MODE: read-only; no hooks; no code patches; no game-memory writes; no game functions invoked");
-    Log(L"BOOT17_SCOPE: transform getter/callee; Host+0x638/+0x938 handoff targets; selected component RTTI and interior records");
-    Log(L"TEST_SCENARIOS: F10 Freedrive vehicle; F11 HQ pedestrian before Leave; F12 immediately after native HQ Leave; F13 after walking 5-10m");
-    Log(L"IMPORTANT: trigger Leave manually in-game between F11 and F12; DLL never calls Leave");
-    Log(L"EXCLUDED: no attempt to leave a Freedrive vehicle; no forced spawn or teleport");
-    Log(L"Game executable: %s", exe);
-
-    if (!WaitForHotkey(VK_F10, L"01_FREEDRIVE_VEHICLE")) return 0;
-    std::wstring dir = RunCapture();
-    if (dir.empty()) return 0;
-
-    if (!WaitForHotkey(VK_F11, L"02_HQ_PEDESTRIAN_BEFORE_LEAVE")) {
-        Log(L"BOOT16_SEQUENCE_INCOMPLETE: HQ pre-Leave snapshot missing; directory=%s", dir.c_str());
-        return 0;
-    }
-    HMODULE module = GetModuleHandleW(nullptr);
-    if (!module) {
-        Log(L"BOOT16_HQ_ABORT: main module unavailable");
-        return 0;
-    }
-    IMAGE_DOS_HEADER dos{};
-    IMAGE_NT_HEADERS64 nt{};
-    const BYTE* image = reinterpret_cast<const BYTE*>(module);
-    if (!ReadMemory(image, &dos, sizeof(dos)) || dos.e_magic != IMAGE_DOS_SIGNATURE ||
-        !ReadMemory(image + dos.e_lfanew, &nt, sizeof(nt)) ||
-        nt.Signature != IMAGE_NT_SIGNATURE || nt.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
-        nt.FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 ||
-        nt.OptionalHeader.SizeOfImage != kImageSize || nt.FileHeader.TimeDateStamp != kImageTimestamp) {
-        Log(L"BOOT16_HQ_ABORT: invalid module headers or executable fingerprint");
-        return 0;
-    }
-    CaptureTransitionHostSnapshot(image, nt.OptionalHeader.SizeOfImage, nt,
-                                  L"02_HQ_PEDESTRIAN_BEFORE_LEAVE", dir);
-
-    Log(L"BOOT17_ACTION_REQUIRED: use the game's native Leave action in HQ; wait for the transition to finish, then press Ctrl+Shift+F12 immediately; after that walk 5-10m in the open world, stop, and press Ctrl+Shift+F13");
-    if (!WaitForHotkey(VK_F12, L"03_AFTER_HQ_LEAVE")) {
-        Log(L"BOOT16_SEQUENCE_INCOMPLETE: post-Leave snapshot missing; directory=%s", dir.c_str());
-        return 0;
-    }
-    CaptureTransitionHostSnapshot(image, nt.OptionalHeader.SizeOfImage, nt,
-                                  L"03_AFTER_HQ_LEAVE", dir);
-
-    if (!WaitForHotkey(VK_F13, L"04_AFTER_HQ_LEAVE_WALK")) {
-        Log(L"BOOT17_SEQUENCE_INCOMPLETE: post-walk snapshot missing; directory=%s", dir.c_str());
-        return 0;
-    }
-    CaptureTransitionHostSnapshot(image, nt.OptionalHeader.SizeOfImage, nt,
-                                  L"04_AFTER_HQ_LEAVE_WALK", dir);
-    Log(L"BOOTSTRAP17_SEQUENCE_COMPLETE: directory=%s", dir.c_str());
+    Log(L"=== TC2 factory reference probe 18 ===");
+    Log(L"BOOTSTRAP_VERSION: 18");
+    Log(L"PROBE_MODE: read-only; reference matches require offline validation");
+    Log(L"FACTORY_ACTION_REQUIRED: in Freedrive vehicle, press Ctrl+Shift+F10 once");
+    if (!WaitForHotkey(VK_F10, L"FACTORY_FREEDRIVE")) return 0;
+    const std::wstring dir = RunCapture();
+    if (!dir.empty()) Log(L"FACTORY_SEQUENCE_COMPLETE: directory=%s", dir.c_str());
     return 0;
 }
 bool LoadOriginal() {

@@ -4,7 +4,7 @@ name: Build TC2 Walkmod bootstrap
 on:
   workflow_dispatch:
   push:
-    branches: [ main, master, starter-06-safe-scan, starter-07-readable-sections, starter-08-referenced-object-capture, analysis-05-native-lifecycle-ver09, analysis-08-component-host-snapshot, analysis-14-bootstrap12-two-state, analysis-15-bootstrap13-lifecycle, analysis-16-bootstrap14-host-table, analysis-17-bootstrap15-spawn-bridge, analysis-18-bootstrap16-hq-leave-handoff, analysis-19-bootstrap17-semantic-capture ]
+    branches: [ main, master, starter-06-safe-scan, starter-07-readable-sections, starter-08-referenced-object-capture, analysis-05-native-lifecycle-ver09, analysis-08-component-host-snapshot, analysis-14-bootstrap12-two-state, analysis-15-bootstrap13-lifecycle, analysis-16-bootstrap14-host-table, analysis-17-bootstrap15-spawn-bridge, analysis-18-bootstrap16-hq-leave-handoff, analysis-19-bootstrap17-semantic-capture, development-2026-11-22 ]
 
 jobs:
   build:
@@ -22,8 +22,9 @@ jobs:
       - name: Upload DLL and symbols
         uses: actions/upload-artifact@v7
         with:
-          name: TC2-Walkmod-bootstrap-x64
+          name: TC2-factory-reference-probe-x64
           path: |
             build/Release/dinput8.dll
             build/Release/dinput8.pdb
+            docs/TEST_RESULTS.md
           if-no-files-found: error
